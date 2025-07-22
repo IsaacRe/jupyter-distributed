@@ -106,7 +106,11 @@ message = f"Process {__process_id__}"
         namespace = {'existing_var': 42}
         process_id = 1
         
-        pid, result_vars, captured_output, error = self.magic._execute_in_process((code, namespace, process_id))
+        # Create a mock queue for the new signature
+        from unittest.mock import Mock
+        mock_queue = Mock()
+        
+        pid, result_vars, error = self.magic._execute_in_process((code, namespace, process_id, mock_queue))
         
         assert pid == 1
         assert error is None
@@ -114,7 +118,6 @@ message = f"Process {__process_id__}"
         assert result_vars['message'] == "Process 1"
         assert result_vars['__process_id__'] == 1
         assert result_vars['existing_var'] == 42
-        assert captured_output == ""  # No print statements in this test
     
     def test_execute_in_process_with_error(self):
         """Test error handling in process execution."""
@@ -122,15 +125,18 @@ message = f"Process {__process_id__}"
         namespace = {}
         process_id = 0
         
-        pid, result_vars, captured_output, error = self.magic._execute_in_process((code, namespace, process_id))
+        # Create a mock queue for the new signature
+        from unittest.mock import Mock
+        mock_queue = Mock()
+        
+        pid, result_vars, error = self.magic._execute_in_process((code, namespace, process_id, mock_queue))
         
         assert pid == 0
         assert result_vars == {}
-        assert captured_output == ""  # No output before error
         assert "division by zero" in error.lower()
     
     def test_execute_in_process_with_stdout(self):
-        """Test stdout capture in process execution."""
+        """Test stdout streaming in process execution."""
         code = """
 print(f"Hello from process {__process_id__}")
 print("Multiple lines")
@@ -140,21 +146,28 @@ result = __process_id__ * 3
         namespace = {}
         process_id = 2
         
-        pid, result_vars, captured_output, error = self.magic._execute_in_process((code, namespace, process_id))
+        # Create a mock queue for the new signature
+        from unittest.mock import Mock
+        mock_queue = Mock()
+        
+        pid, result_vars, error = self.magic._execute_in_process((code, namespace, process_id, mock_queue))
         
         assert pid == 2
         assert error is None
         assert result_vars['result'] == 6
         assert result_vars['__process_id__'] == 2
         
-        # Check captured output
-        expected_lines = [
-            "Hello from process 2",
-            "Multiple lines", 
-            "of output"
+        # Check that output was sent to the queue with proper prefixes
+        expected_calls = [
+            "[Process 2] Hello from process 2",
+            "[Process 2] Multiple lines", 
+            "[Process 2] of output"
         ]
-        output_lines = captured_output.strip().split('\n')
-        assert output_lines == expected_lines
+        
+        # Verify that put was called with the expected prefixed output
+        assert mock_queue.put.call_count == 3
+        actual_calls = [call[0][0] for call in mock_queue.put.call_args_list]
+        assert actual_calls == expected_calls
 
 
 class TestDistributedMagicsIntegration:
@@ -164,16 +177,23 @@ class TestDistributedMagicsIntegration:
         """Set up test fixtures."""
         self.magic = DistributedMagics()
     
+    @patch('multiprocess.Manager')
     @patch('multiprocess.Pool')
-    def test_distribute_basic(self, mock_pool_class):
+    def test_distribute_basic(self, mock_pool_class, mock_manager_class):
         """Test basic distribute command functionality."""
         # Mock the pool and its map method
         mock_pool = Mock()
         mock_pool_class.return_value = mock_pool
         mock_pool.map.return_value = [
-            (0, {'result': 0}, "", None),  # Added captured_output parameter
-            (1, {'result': 1}, "", None)   # Added captured_output parameter
+            (0, {'result': 0}, None),  # Updated to new signature: (process_id, result_vars, error)
+            (1, {'result': 1}, None)   # Updated to new signature: (process_id, result_vars, error)
         ]
+        
+        # Mock the manager and queue
+        mock_manager = Mock()
+        mock_queue = Mock()
+        mock_manager.Queue.return_value = mock_queue
+        mock_manager_class.return_value = mock_manager
         
         # Test the distribute command
         line = "2"
@@ -188,7 +208,7 @@ class TestDistributedMagicsIntegration:
         mock_pool.map.assert_called_once()
         
         # Verify output messages
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
+        print_calls = [str(call[0][0]) for call in mock_print.call_args_list]
         assert any("Distributing execution across 2 processes" in call for call in print_calls)
         assert any("Successfully executed in all 2 processes" in call for call in print_calls)
     

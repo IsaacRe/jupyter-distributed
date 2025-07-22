@@ -12,6 +12,8 @@ import pickle
 import multiprocess as mp
 import io
 import contextlib
+import threading
+import queue
 from typing import Dict, Any, List, Optional
 from IPython.core.magic import Magics, line_cell_magic, magics_class
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
@@ -63,7 +65,7 @@ class DistributedMagics(Magics):
     @staticmethod
     def _execute_in_process(args):
         """Execute code in a separate process with the given namespace."""
-        code, namespace, process_id = args
+        code, namespace, process_id, output_queue = args
         
         # Create a clean execution environment with only picklable objects
         local_env = {}
@@ -81,16 +83,49 @@ class DistributedMagics(Magics):
         # Add the process ID
         local_env['__process_id__'] = process_id
         
-        # Capture stdout during execution
-        stdout_buffer = io.StringIO()
+        # Custom stdout class that streams to queue with prefix
+        class StreamingStdout:
+            def __init__(self, process_id, output_queue):
+                self.process_id = process_id
+                self.output_queue = output_queue
+                self.buffer = ""
+            
+            def write(self, text):
+                # Add text to buffer
+                self.buffer += text
+                
+                # Process complete lines
+                while '\n' in self.buffer:
+                    line, self.buffer = self.buffer.split('\n', 1)
+                    if line:  # Only send non-empty lines
+                        self.output_queue.put(f"[Process {self.process_id}] {line}")
+                
+                # Handle case where text doesn't end with newline but we want immediate output
+                if text and not text.endswith('\n') and '\n' not in text:
+                    # For immediate output without newline, still send it
+                    pass
+            
+            def flush(self):
+                # Flush any remaining buffer content
+                if self.buffer.strip():
+                    self.output_queue.put(f"[Process {self.process_id}] {self.buffer.rstrip()}")
+                    self.buffer = ""
+        
+        # Create streaming stdout
+        streaming_stdout = StreamingStdout(process_id, output_queue)
         
         try:
-            # Execute the code with stdout redirection
-            with contextlib.redirect_stdout(stdout_buffer):
-                exec(code, local_env)
+            # Execute the code with streaming stdout
+            original_stdout = sys.stdout
+            sys.stdout = streaming_stdout
             
-            # Get the captured output
-            captured_output = stdout_buffer.getvalue()
+            exec(code, local_env)
+            
+            # Flush any remaining output
+            streaming_stdout.flush()
+            
+            # Restore original stdout
+            sys.stdout = original_stdout
             
             # Extract only the variables that were assigned in this execution
             # Filter out built-ins and special variables
@@ -105,11 +140,13 @@ class DistributedMagics(Magics):
                         # Skip unpicklable objects
                         pass
             
-            return process_id, result_vars, captured_output, None
+            return process_id, result_vars, None
             
         except Exception as e:
-            captured_output = stdout_buffer.getvalue()
-            return process_id, {}, captured_output, str(e)
+            # Restore original stdout in case of error
+            sys.stdout = original_stdout
+            streaming_stdout.flush()
+            return process_id, {}, str(e)
     
     @line_cell_magic
     @magic_arguments()
@@ -151,6 +188,9 @@ class DistributedMagics(Magics):
         print(f"Distributing execution across {n_processes} processes...")
         start_time = time.time()
         
+        # Create a shared output queue for streaming stdout
+        output_queue = mp.Manager().Queue()
+        
         # Prepare arguments for each process - filter namespaces for picklable objects only
         clean_namespaces = []
         for i in range(n_processes):
@@ -165,7 +205,34 @@ class DistributedMagics(Magics):
                     pass
             clean_namespaces.append(clean_namespace)
         
-        process_args = [(code, clean_namespaces[i], i) for i in range(n_processes)]
+        process_args = [(code, clean_namespaces[i], i, output_queue) for i in range(n_processes)]
+        
+        # Start a thread to handle streaming output
+        output_thread_running = threading.Event()
+        output_thread_running.set()
+        
+        def output_handler():
+            """Handle streaming output from processes."""
+            while output_thread_running.is_set():
+                try:
+                    # Get output from queue with timeout
+                    output_line = output_queue.get(timeout=0.1)
+                    print(output_line, flush=True)
+                except:
+                    # Timeout or empty queue, continue
+                    continue
+            
+            # Process any remaining output after processes complete
+            while not output_queue.empty():
+                try:
+                    output_line = output_queue.get_nowait()
+                    print(output_line, flush=True)
+                except:
+                    break
+        
+        # Start output handling thread
+        output_thread = threading.Thread(target=output_handler, daemon=True)
+        output_thread.start()
         
         try:
             # Execute in parallel
@@ -174,35 +241,31 @@ class DistributedMagics(Magics):
             else:
                 results = pool.map(self._execute_in_process, process_args)
             
+            # Stop output thread
+            output_thread_running.clear()
+            output_thread.join(timeout=1.0)  # Wait for output thread to finish
+            
             execution_time = time.time() - start_time
             
             # Process results
             errors = []
             success_count = 0
             
-            for process_id, result_vars, captured_output, error in results:
+            for process_id, result_vars, error in results:
                 if error:
                     errors.append(f"Process {process_id}: {error}")
                 else:
                     success_count += 1
                     # Update the namespace for this process
                     namespaces[process_id].update(result_vars)
-                
-                # Display captured output from this process
-                if captured_output and captured_output.strip():
-                    print(f"\n--- Output from Process {process_id} ---")
-                    # Print each line with proper indentation
-                    for line in captured_output.rstrip('\n').split('\n'):
-                        print(line)
-                    print(f"--- End Process {process_id} Output ---")
             
             # Display results
             if errors:
-                print(f"\nExecution completed with errors in {len(errors)} processes:")
+                print(f"Execution completed with errors in {len(errors)} processes:")
                 for error in errors:
                     print(f"  {error}")
             else:
-                print(f"\nSuccessfully executed in all {n_processes} processes")
+                print(f"Successfully executed in all {n_processes} processes")
             
             print(f"Execution time: {execution_time:.2f} seconds")
             
