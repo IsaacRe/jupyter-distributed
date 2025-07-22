@@ -58,7 +58,8 @@ class DistributedMagics(Magics):
         except SyntaxError:
             return []
     
-    def _execute_in_process(self, args):
+    @staticmethod
+    def _execute_in_process(args):
         """Execute code in a separate process with the given namespace."""
         code, namespace, process_id = args
         
