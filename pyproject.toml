@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jupyter-distributed"
+dynamic = ["version"]
+description = "A Jupyter extension for distributed parallel execution of cells"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Framework :: Jupyter",
+]
+dependencies = [
+    "ipython>=7.0.0",
+    "jupyter>=1.0.0",
+    "multiprocess>=0.70.0",
+    "dill>=0.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/jupyter-distributed"
+Repository = "https://github.com/yourusername/jupyter-distributed"
+Issues = "https://github.com/yourusername/jupyter-distributed/issues"
+
+[tool.setuptools_scm]
+write_to = "jupyter_distributed/_version.py"
