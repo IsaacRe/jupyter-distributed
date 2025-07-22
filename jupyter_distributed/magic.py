@@ -10,6 +10,8 @@ import sys
 import time
 import pickle
 import multiprocess as mp
+import io
+import contextlib
 from typing import Dict, Any, List, Optional
 from IPython.core.magic import Magics, line_cell_magic, magics_class
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
@@ -79,9 +81,16 @@ class DistributedMagics(Magics):
         # Add the process ID
         local_env['__process_id__'] = process_id
         
+        # Capture stdout during execution
+        stdout_buffer = io.StringIO()
+        
         try:
-            # Execute the code
-            exec(code, local_env)
+            # Execute the code with stdout redirection
+            with contextlib.redirect_stdout(stdout_buffer):
+                exec(code, local_env)
+            
+            # Get the captured output
+            captured_output = stdout_buffer.getvalue()
             
             # Extract only the variables that were assigned in this execution
             # Filter out built-ins and special variables
@@ -96,10 +105,11 @@ class DistributedMagics(Magics):
                         # Skip unpicklable objects
                         pass
             
-            return process_id, result_vars, None
+            return process_id, result_vars, captured_output, None
             
         except Exception as e:
-            return process_id, {}, str(e)
+            captured_output = stdout_buffer.getvalue()
+            return process_id, {}, captured_output, str(e)
     
     @line_cell_magic
     @magic_arguments()
@@ -170,21 +180,29 @@ class DistributedMagics(Magics):
             errors = []
             success_count = 0
             
-            for process_id, result_vars, error in results:
+            for process_id, result_vars, captured_output, error in results:
                 if error:
                     errors.append(f"Process {process_id}: {error}")
                 else:
                     success_count += 1
                     # Update the namespace for this process
                     namespaces[process_id].update(result_vars)
+                
+                # Display captured output from this process
+                if captured_output and captured_output.strip():
+                    print(f"\n--- Output from Process {process_id} ---")
+                    # Print each line with proper indentation
+                    for line in captured_output.rstrip('\n').split('\n'):
+                        print(line)
+                    print(f"--- End Process {process_id} Output ---")
             
             # Display results
             if errors:
-                print(f"Execution completed with errors in {len(errors)} processes:")
+                print(f"\nExecution completed with errors in {len(errors)} processes:")
                 for error in errors:
                     print(f"  {error}")
             else:
-                print(f"Successfully executed in all {n_processes} processes")
+                print(f"\nSuccessfully executed in all {n_processes} processes")
             
             print(f"Execution time: {execution_time:.2f} seconds")
             

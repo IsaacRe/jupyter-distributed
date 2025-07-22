@@ -106,7 +106,7 @@ message = f"Process {__process_id__}"
         namespace = {'existing_var': 42}
         process_id = 1
         
-        pid, result_vars, error = self.magic._execute_in_process((code, namespace, process_id))
+        pid, result_vars, captured_output, error = self.magic._execute_in_process((code, namespace, process_id))
         
         assert pid == 1
         assert error is None
@@ -114,6 +114,7 @@ message = f"Process {__process_id__}"
         assert result_vars['message'] == "Process 1"
         assert result_vars['__process_id__'] == 1
         assert result_vars['existing_var'] == 42
+        assert captured_output == ""  # No print statements in this test
     
     def test_execute_in_process_with_error(self):
         """Test error handling in process execution."""
@@ -121,11 +122,39 @@ message = f"Process {__process_id__}"
         namespace = {}
         process_id = 0
         
-        pid, result_vars, error = self.magic._execute_in_process((code, namespace, process_id))
+        pid, result_vars, captured_output, error = self.magic._execute_in_process((code, namespace, process_id))
         
         assert pid == 0
         assert result_vars == {}
+        assert captured_output == ""  # No output before error
         assert "division by zero" in error.lower()
+    
+    def test_execute_in_process_with_stdout(self):
+        """Test stdout capture in process execution."""
+        code = """
+print(f"Hello from process {__process_id__}")
+print("Multiple lines")
+print("of output")
+result = __process_id__ * 3
+"""
+        namespace = {}
+        process_id = 2
+        
+        pid, result_vars, captured_output, error = self.magic._execute_in_process((code, namespace, process_id))
+        
+        assert pid == 2
+        assert error is None
+        assert result_vars['result'] == 6
+        assert result_vars['__process_id__'] == 2
+        
+        # Check captured output
+        expected_lines = [
+            "Hello from process 2",
+            "Multiple lines", 
+            "of output"
+        ]
+        output_lines = captured_output.strip().split('\n')
+        assert output_lines == expected_lines
 
 
 class TestDistributedMagicsIntegration:
@@ -142,8 +171,8 @@ class TestDistributedMagicsIntegration:
         mock_pool = Mock()
         mock_pool_class.return_value = mock_pool
         mock_pool.map.return_value = [
-            (0, {'result': 0}, None),
-            (1, {'result': 1}, None)
+            (0, {'result': 0}, "", None),  # Added captured_output parameter
+            (1, {'result': 1}, "", None)   # Added captured_output parameter
         ]
         
         # Test the distribute command
