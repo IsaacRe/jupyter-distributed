@@ -12,6 +12,7 @@ import multiprocess as mp
 import threading
 import queue
 import signal
+from datetime import datetime
 import os
 from typing import Dict, Any, List, Optional
 from IPython.core.magic import Magics, line_cell_magic, magics_class
@@ -49,15 +50,32 @@ def worker_process(input_queue, output_queue, process_id):
     sys.stdout = QueueWriter(output_queue, process_id)
     sys.stderr = QueueWriter(output_queue, process_id)
 
-    sys.stdout.write(f"Worker process {process_id} started with PID {os.getpid()}\n")
-    sys.stdout.flush()
+    # Diagnostic logging function
+    diag_start = datetime.now()
+    debug = False
+    def log_diagnostic(message):
+        if debug:
+            elapsed_seconds = (datetime.now() - diag_start).total_seconds()
+            elapsed_minutes = elapsed_seconds // 60
+            elapsed_seconds %= 60
+            relative_timestamp = f"{elapsed_minutes:.0f}:{elapsed_seconds:.5f}"
+            sys.stdout.write(f"[DIAGNOSTIC] Process {process_id} at {relative_timestamp}: {message}\n")
+            sys.stdout.flush()
+
+    log_diagnostic(f"Worker process started with PID {os.getpid()}")
 
     while True:
         try:
+            diag_start = datetime.now()
+            log_diagnostic("Waiting for task from input queue")
             task = input_queue.get()
+            debug = task.get('debug', False)
+
             if task is None:  # Shutdown signal
+                log_diagnostic("Received shutdown signal")
                 break
 
+            log_diagnostic("Received task, starting execution")
             code = task.get('code')
             timeout = task.get('timeout')
 
@@ -65,24 +83,29 @@ def worker_process(input_queue, output_queue, process_id):
                 if timeout:
                     signal.alarm(timeout)
                 
+                log_diagnostic("About to execute code")
+                exec_start = time.time()
                 exec(code, namespace)
+                exec_end = time.time()
+                log_diagnostic(f"Code execution completed in {exec_end - exec_start:.3f} seconds")
                 sys.stdout.flush()
                 
                 if timeout:
                     signal.alarm(0) # Cancel alarm
                 
+                log_diagnostic("Sending result to output queue")
+                # For now do not return variables from distributed cells to non-distributed runtime
                 # Filter out unpicklable objects from the namespace
                 result_vars = {}
-                for key, value in namespace.items():
-                    if not key.startswith('__'):
-                        try:
-                            dill.dumps(value)
-                            result_vars[key] = value
-                        except (TypeError, AttributeError, dill.PicklingError):
-                            pass # Skip unpicklable
-                
-                # For now do not return variables from distributed cells to non-distributed runtime
-                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': None})
+                # for key, value in namespace.items():
+                #     if not key.startswith('__'):
+                #         try:
+                #             dill.dumps(value)
+                #             result_vars[key] = value
+                #         except (TypeError, AttributeError, dill.PicklingError):
+                #             pass # Skip unpicklable
+                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': result_vars, 'error': None})
+                log_diagnostic("Result sent successfully")
 
             except TimeoutException:
                 sys.stdout.flush()
@@ -119,7 +142,7 @@ class DistributedMagics(Magics):
             # We'll proceed, but the user might see warnings.
             pass
 
-    def _get_or_create_workers(self, n_processes: int):
+    def _get_or_create_workers(self, n_processes: int) -> List[Dict[str, Any]]:
         """Get or create a set of persistent worker processes."""
         if n_processes not in self.workers:
             self.workers[n_processes] = []
@@ -146,6 +169,7 @@ class DistributedMagics(Magics):
     @line_cell_magic
     @magic_arguments()
     @argument('n_processes', type=int, help='Number of processes to distribute across')
+    @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
     @argument('--timeout', type=int, default=None, help='Timeout in seconds for execution')
     def distribute(self, line, cell=None):
         """
@@ -175,12 +199,23 @@ class DistributedMagics(Magics):
         print(f"Distributing execution across {n_processes} persistent processes...")
         start_time = time.time()
 
+        diag_start = datetime.now()
+        def log_diagnostic(message):
+            if args.debug:
+                elapsed_seconds = (datetime.now() - diag_start).total_seconds()
+                elapsed_minutes = elapsed_seconds // 60
+                elapsed_seconds %= 60
+                relative_timestamp = f"{elapsed_minutes:.0f}:{elapsed_seconds:.5f}"
+                print(f"[MAIN] at {relative_timestamp}: {message}\n")
+
         # Send code to all worker processes
-        for worker in workers:
+        log_diagnostic(f"Starting to send tasks to {n_processes} workers")
+        for i, worker in enumerate(workers):
             # Clear output queue before starting
             while not worker['output_queue'].empty():
                 worker['output_queue'].get()
-            worker['input_queue'].put({'code': code, 'timeout': args.timeout})
+            worker['input_queue'].put({'code': code, 'timeout': args.timeout, 'debug': args.debug})
+            log_diagnostic(f"Task sent to worker {i}")
 
         # Collect results and stream output
         results = [None] * n_processes
@@ -193,18 +228,25 @@ class DistributedMagics(Magics):
             timer = threading.Timer(args.timeout, timeout_event.set)
             timer.start()
 
+        log_diagnostic(f"Starting result collection")
+        last_activity = time.time()
+        
         try:
             while completed_count < n_processes and not timeout_event.is_set():
+                activity_this_cycle = False
                 for i, worker in enumerate(workers):
                     if results[i] is not None:
                         continue
                     try:
                         output = worker['output_queue'].get(timeout=0.01)
+                        activity_this_cycle = True
+                        last_activity = time.time()
 
                         if output['type'] == 'stdout':
                             carriage_return = '\r'
                             print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
                         elif output['type'] == 'result':
+                            log_diagnostic(f"Received result from worker {i} with process ID {output['process_id']}")
                             results[i] = output
                             completed_count += 1
                             if output['error']:
@@ -214,6 +256,11 @@ class DistributedMagics(Magics):
                                 worker['namespace'].update(output['vars'])
                     except queue.Empty:
                         continue
+                
+                # Log if we haven't seen activity for a while
+                if not activity_this_cycle and time.time() - last_activity > 5.0:
+                    print(f"[MAIN] No activity for {time.time() - last_activity:.1f}s, completed: {completed_count}/{n_processes}")
+                    last_activity = time.time()  # Reset to avoid spam
         
             if errors:
                 print(f"Execution completed with errors in {len(errors)} processes:")
