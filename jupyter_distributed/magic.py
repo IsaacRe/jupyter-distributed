@@ -21,42 +21,22 @@ def worker_process(input_queue, output_queue, process_id):
     """
     A persistent worker process that maintains its own namespace and executes code.
     """
-    # Disable Jupyter comms in the worker process to prevent warnings
-    try:
-        from ipykernel.comm import Comm
-        Comm.instance = lambda: None
-    except (ImportError, AttributeError):
-        pass
-
     namespace = {'__process_id__': process_id}
     
-    # Custom stdout class that streams to queue with prefix
-    class StreamingStdout:
-        def __init__(self, process_id, output_queue):
+    # Redirect stdout to a queue
+    class QueueWriter:
+        def __init__(self, queue, process_id):
+            self.queue = queue
             self.process_id = process_id
-            self.output_queue = output_queue
-            self.buffer = ""
 
         def write(self, text):
-            # Handle carriage returns for progress bars
-            if '\r' in text:
-                # Send progress-like updates as a special message type
-                self.output_queue.put({'type': 'stdout_stream', 'data': f"[Process {self.process_id}] {text.strip()}"})
-            else:
-                self.buffer += text
-                while '\n' in self.buffer:
-                    line, self.buffer = self.buffer.split('\n', 1)
-                    if line:
-                        self.output_queue.put({'type': 'stdout', 'data': f"[Process {self.process_id}] {line}"})
-        
-        def flush(self):
-            if self.buffer.strip():
-                self.output_queue.put({'type': 'stdout', 'data': f"[Process {self.process_id}] {self.buffer.rstrip()}"})
-                self.buffer = ""
+            self.queue.put({'type': 'stdout', 'process_id': self.process_id, 'data': text})
 
-    streaming_stdout = StreamingStdout(process_id, output_queue)
-    original_stdout = sys.stdout
-    sys.stdout = streaming_stdout
+        def flush(self):
+            pass
+
+    sys.stdout = QueueWriter(output_queue, process_id)
+    sys.stderr = QueueWriter(output_queue, process_id)
 
     while True:
         try:
@@ -72,7 +52,7 @@ def worker_process(input_queue, output_queue, process_id):
 
             try:
                 exec(code, namespace)
-                streaming_stdout.flush()
+                sys.stdout.flush()
                 
                 # Filter out unpicklable objects from the namespace
                 result_vars = {}
@@ -87,13 +67,11 @@ def worker_process(input_queue, output_queue, process_id):
                 output_queue.put({'type': 'result', 'process_id': process_id, 'vars': result_vars, 'error': None})
 
             except Exception as e:
-                streaming_stdout.flush()
+                sys.stdout.flush()
                 output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': str(e)})
 
         except (KeyboardInterrupt, EOFError):
             break
-    
-    sys.stdout = original_stdout
 
 
 @magics_class
@@ -103,6 +81,14 @@ class DistributedMagics(Magics):
     def __init__(self, shell=None):
         super().__init__(shell)
         self.workers = {}  # {n_processes: [worker_info]}
+        # Use 'spawn' start method for multiprocessing to avoid issues with
+        # forked processes in interactive environments like Jupyter.
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            # This can happen if the context is already set and we can't force it.
+            # We'll proceed, but the user might see warnings.
+            pass
 
     def _get_or_create_workers(self, n_processes: int):
         """Get or create a set of persistent worker processes."""
@@ -169,46 +155,36 @@ class DistributedMagics(Magics):
             timer = threading.Timer(args.timeout, timeout_event.set)
             timer.start()
 
-        # Track last line length for progress bar overwriting
-        last_line_len = 0
-
-        while completed_count < n_processes and not timeout_event.is_set():
-            for i, worker in enumerate(workers):
-                if results[i] is not None:
-                    continue
-                try:
-                    output = worker['output_queue'].get(timeout=0.01)
-                    
-                    if output['type'] == 'stdout':
-                        # Clear previous line if it was a stream
-                        if last_line_len > 0:
-                            print(' ' * last_line_len, end='\r')
-                            last_line_len = 0
-                        print(output['data'], flush=True)
-                    elif output['type'] == 'stdout_stream':
-                        # Overwrite the current line for progress bars
-                        print(output['data'], end='\r', flush=True)
-                        last_line_len = len(output['data'])
-                    elif output['type'] == 'result':
-                        # Clear any lingering progress bar line
-                        if last_line_len > 0:
-                            print(' ' * last_line_len, end='\r')
-                            last_line_len = 0
-                        
-                        results[i] = output
-                        completed_count += 1
-                        if output['error']:
-                            errors.append(f"Process {output['process_id']}: {output['error']}")
-                        else:
-                            # Update local cache of namespace
-                            worker['namespace'].update(output['vars'])
-
-                except queue.Empty:
-                    continue
+        # Use a single thread to process all output queues
+        def process_output_queues(workers, results, errors, completed_count_ref):
+            while completed_count_ref[0] < n_processes:
+                for i, worker in enumerate(workers):
+                    if results[i] is not None:
+                        continue
+                    try:
+                        output = worker['output_queue'].get(timeout=0.01)
+                        if output['type'] == 'stdout':
+                            # Handle carriage returns for progress bars
+                            if '\r' in output['data']:
+                                print(output['data'], end='', flush=True)
+                            else:
+                                print(f"[Process {i}] {output['data']}", flush=True)
+                        elif output['type'] == 'result':
+                            results[i] = output
+                            completed_count_ref[0] += 1
+                            if output['error']:
+                                errors.append(f"Process {i}: {output['error']}")
+                            else:
+                                worker['namespace'].update(output['vars'])
+                    except queue.Empty:
+                        continue
+                if timeout_event.is_set():
+                    break
         
-        # Final clear of any progress bar line
-        if last_line_len > 0:
-            print(' ' * last_line_len, end='\r')
+        completed_count_ref = [0]
+        output_thread = threading.Thread(target=process_output_queues, args=(workers, results, errors, completed_count_ref))
+        output_thread.start()
+        output_thread.join(timeout=args.timeout)
         
         if args.timeout:
             timer.cancel()
