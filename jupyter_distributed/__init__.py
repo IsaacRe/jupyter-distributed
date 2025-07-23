@@ -11,16 +11,27 @@ except ImportError:
 
 from .magic import DistributedMagics
 
+# Global instance to hold the magic object
+_magic_instance = None
+
 def load_ipython_extension(ipython):
     """Load the extension in IPython."""
-    magics = DistributedMagics(ipython)
-    ipython.register_magics(magics)
-    print("Jupyter Distributed extension loaded. Use %distribute n to run cells in parallel.")
+    global _magic_instance
+    if _magic_instance is None:
+        _magic_instance = DistributedMagics(ipython)
+        ipython.register_magics(_magic_instance)
+        print("Jupyter Distributed extension with persistent processes loaded.")
+    else:
+        print("Jupyter Distributed extension already loaded.")
 
 def unload_ipython_extension(ipython):
-    """Unload the extension from IPython."""
-    # Clean up any resources if needed
-    pass
+    """Unload the extension from IPython and clean up resources."""
+    global _magic_instance
+    if _magic_instance:
+        # Clean up worker processes
+        _magic_instance._cleanup_workers()
+        _magic_instance = None
+        print("Jupyter Distributed extension unloaded and processes cleaned up.")
 
 # Make the magic available for direct import
 __all__ = ['DistributedMagics', 'load_ipython_extension', 'unload_ipython_extension']
