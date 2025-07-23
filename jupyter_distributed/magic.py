@@ -45,10 +45,6 @@ def worker_process(input_queue, output_queue, process_id):
                 break
 
             code = task.get('code')
-            sync_vars = task.get('sync_vars')
-
-            if sync_vars:
-                namespace.update(sync_vars)
 
             try:
                 exec(code, namespace)
@@ -64,7 +60,8 @@ def worker_process(input_queue, output_queue, process_id):
                         except (TypeError, AttributeError, dill.PicklingError):
                             pass # Skip unpicklable
                 
-                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': result_vars, 'error': None})
+                # For now do not return variables from distributed cells to non-distributed runtime
+                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': None})
 
             except Exception as e:
                 sys.stdout.flush()
@@ -110,15 +107,14 @@ class DistributedMagics(Magics):
     @line_cell_magic
     @magic_arguments()
     @argument('n_processes', type=int, help='Number of processes to distribute across')
-    @argument('--sync', action='store_true', help='Synchronize variables from process 0 to all others after execution')
     @argument('--timeout', type=int, default=None, help='Timeout in seconds for execution')
     def distribute(self, line, cell=None):
         """
         Distribute cell execution across n persistent processes.
         
         Usage:
-            %distribute n [--sync] [--timeout SECONDS]
-            %%distribute n [--sync] [--timeout SECONDS]
+            %distribute n [--timeout SECONDS]
+            %%distribute n [--timeout SECONDS]
             <cell content>
         
         Variables persist in each process across multiple calls.
@@ -205,31 +201,6 @@ class DistributedMagics(Magics):
             print(f"Successfully executed in all {n_processes} processes")
             
         print(f"Execution time: {execution_time:.2f} seconds")
-
-        # Synchronize variables if requested
-        if args.sync and not errors:
-            self._sync_variables(n_processes)
-            print("Variables synchronized from process 0 to all others.")
-
-    def _sync_variables(self, n_processes: int):
-        """Synchronize variables from process 0 to all other processes."""
-        workers = self.workers.get(n_processes)
-        if not workers or not workers[0]['namespace']:
-            return
-
-        # Get all picklable variables from process 0's namespace
-        source_vars = {}
-        for key, value in workers[0]['namespace'].items():
-            try:
-                dill.dumps(value)
-                source_vars[key] = value
-            except (TypeError, AttributeError, dill.PicklingError):
-                pass
-
-        # Send these variables to all other processes for synchronization
-        for i in range(1, n_processes):
-            workers[i]['input_queue'].put({'code': '', 'sync_vars': source_vars})
-            workers[i]['namespace'].update(source_vars) # Update local cache
 
     def _cleanup_workers(self, n_processes: Optional[int] = None):
         """Terminate and clean up worker processes."""
