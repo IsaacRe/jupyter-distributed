@@ -165,37 +165,32 @@ class DistributedMagics(Magics):
         errors = []
         completed_count = 0
         
-        # Use a single thread to process all output queues
-        def process_output_queues(workers, results, errors, completed_count_ref):
-            while completed_count_ref[0] < n_processes:
-                for i, worker in enumerate(workers):
-                    if results[i] is not None:
-                        continue
-                    try:
-                        output = worker['output_queue'].get(timeout=0.01)
-                        if output['type'] == 'stdout':
-                            # Handle carriage returns for progress bars
-                            if '\r' in output['data']:
-                                print(output['data'], end='', flush=True)
-                            else:
-                                print(f"[Process {i}] {output['data']}", flush=True)
-                        elif output['type'] == 'result':
-                            results[i] = output
-                            completed_count_ref[0] += 1
-                            if output['error']:
-                                errors.append(f"Process {i}: {output['error']}")
-                            else:
-                                worker['namespace'].update(output['vars'])
-                    except queue.Empty:
-                        continue
-        
-        completed_count_ref = [0]
-        output_thread = threading.Thread(target=process_output_queues, args=(workers, results, errors, completed_count_ref))
-        output_thread.start()
-        output_thread.join(timeout=args.timeout)
+        # Timeout handling
+        timeout_event = threading.Event()
+        if args.timeout:
+            timer = threading.Timer(args.timeout, timeout_event.set)
+            timer.start()
 
-        if not output_thread.is_alive():
-            pass
+        while completed_count < n_processes and not timeout_event.is_set():
+            for i, worker in enumerate(workers):
+                if results[i] is not None:
+                    continue
+                try:
+                    output = worker['output_queue'].get(timeout=0.01)
+
+                    if output['type'] == 'stdout':
+                        carriage_return = '\r'
+                        print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
+                    elif output['type'] == 'result':
+                        results[i] = output
+                        completed_count += 1
+                        if output['error']:
+                            errors.append(f"Process {output['process_id']}: {output['error']}")
+                        else:
+                            # Update local cache of namespace
+                            worker['namespace'].update(output['vars'])
+                except queue.Empty:
+                    continue
         
         execution_time = time.time() - start_time
         
