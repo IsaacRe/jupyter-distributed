@@ -21,6 +21,13 @@ def worker_process(input_queue, output_queue, process_id):
     """
     A persistent worker process that maintains its own namespace and executes code.
     """
+    # Disable Jupyter comms in the worker process to prevent warnings
+    try:
+        from ipykernel.comm import Comm
+        Comm.instance = lambda: None
+    except (ImportError, AttributeError):
+        pass
+
     namespace = {'__process_id__': process_id}
     
     # Custom stdout class that streams to queue with prefix
@@ -29,13 +36,18 @@ def worker_process(input_queue, output_queue, process_id):
             self.process_id = process_id
             self.output_queue = output_queue
             self.buffer = ""
-        
+
         def write(self, text):
-            self.buffer += text
-            while '\n' in self.buffer:
-                line, self.buffer = self.buffer.split('\n', 1)
-                if line:
-                    self.output_queue.put({'type': 'stdout', 'data': f"[Process {self.process_id}] {line}"})
+            # Handle carriage returns for progress bars
+            if '\r' in text:
+                # Send progress-like updates as a special message type
+                self.output_queue.put({'type': 'stdout_stream', 'data': f"[Process {self.process_id}] {text.strip()}"})
+            else:
+                self.buffer += text
+                while '\n' in self.buffer:
+                    line, self.buffer = self.buffer.split('\n', 1)
+                    if line:
+                        self.output_queue.put({'type': 'stdout', 'data': f"[Process {self.process_id}] {line}"})
         
         def flush(self):
             if self.buffer.strip():
@@ -157,6 +169,9 @@ class DistributedMagics(Magics):
             timer = threading.Timer(args.timeout, timeout_event.set)
             timer.start()
 
+        # Track last line length for progress bar overwriting
+        last_line_len = 0
+
         while completed_count < n_processes and not timeout_event.is_set():
             for i, worker in enumerate(workers):
                 if results[i] is not None:
@@ -165,8 +180,21 @@ class DistributedMagics(Magics):
                     output = worker['output_queue'].get(timeout=0.01)
                     
                     if output['type'] == 'stdout':
+                        # Clear previous line if it was a stream
+                        if last_line_len > 0:
+                            print(' ' * last_line_len, end='\r')
+                            last_line_len = 0
                         print(output['data'], flush=True)
+                    elif output['type'] == 'stdout_stream':
+                        # Overwrite the current line for progress bars
+                        print(output['data'], end='\r', flush=True)
+                        last_line_len = len(output['data'])
                     elif output['type'] == 'result':
+                        # Clear any lingering progress bar line
+                        if last_line_len > 0:
+                            print(' ' * last_line_len, end='\r')
+                            last_line_len = 0
+                        
                         results[i] = output
                         completed_count += 1
                         if output['error']:
@@ -177,6 +205,10 @@ class DistributedMagics(Magics):
 
                 except queue.Empty:
                     continue
+        
+        # Final clear of any progress bar line
+        if last_line_len > 0:
+            print(' ' * last_line_len, end='\r')
         
         if args.timeout:
             timer.cancel()
