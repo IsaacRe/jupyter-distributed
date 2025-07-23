@@ -80,6 +80,8 @@ def worker_process(input_queue, output_queue, process_id):
             timeout = task.get('timeout')
 
             try:
+                warnings = []
+
                 if timeout:
                     signal.alarm(timeout)
                 
@@ -92,6 +94,10 @@ def worker_process(input_queue, output_queue, process_id):
                 
                 if timeout:
                     signal.alarm(0) # Cancel alarm
+
+                # Alert if stdout/stderr has been tampered with by the executed code
+                if not (isinstance(sys.stdout, QueueWriter) and isinstance(sys.stderr, QueueWriter)):
+                    warnings.append("stdout/stderr have been modified by the executed code, which may lead to unexpected behavior.")
                 
                 log_diagnostic("Sending result to output queue")
                 # For now do not return variables from distributed cells to non-distributed runtime
@@ -104,7 +110,7 @@ def worker_process(input_queue, output_queue, process_id):
                 #             result_vars[key] = value
                 #         except (TypeError, AttributeError, dill.PicklingError):
                 #             pass # Skip unpicklable
-                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': result_vars, 'error': None})
+                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': result_vars, 'error': None, 'warnings': warnings})
                 log_diagnostic("Result sent successfully")
 
             except TimeoutException:
@@ -254,6 +260,9 @@ class DistributedMagics(Magics):
                             else:
                                 # Update local cache of namespace
                                 worker['namespace'].update(output['vars'])
+                        if output.get('warnings'):
+                            for warning in output['warnings']:
+                                print(f"[Process {output['process_id']}] Warning: {warning}", flush=True)
                     except queue.Empty:
                         continue
                 
