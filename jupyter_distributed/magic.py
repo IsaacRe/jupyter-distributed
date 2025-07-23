@@ -12,6 +12,7 @@ import multiprocess as mp
 import threading
 import queue
 import signal
+import os
 from typing import Dict, Any, List, Optional
 from IPython.core.magic import Magics, line_cell_magic, magics_class
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
@@ -48,6 +49,9 @@ def worker_process(input_queue, output_queue, process_id):
     sys.stdout = QueueWriter(output_queue, process_id)
     sys.stderr = QueueWriter(output_queue, process_id)
 
+    sys.stdout.write(f"Worker process {process_id} started with PID {os.getpid()}\n")
+    sys.stdout.flush()
+
     while True:
         try:
             task = input_queue.get()
@@ -83,11 +87,19 @@ def worker_process(input_queue, output_queue, process_id):
             except TimeoutException:
                 sys.stdout.flush()
                 output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': f"Execution timed out after {timeout} seconds"})
+            except KeyboardInterrupt:
+                sys.stdout.write(f"Received SIGINT for process {process_id}\n")
+                sys.stdout.flush()
+                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': "Execution interrupted"})
             except Exception as e:
                 sys.stdout.flush()
                 output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': str(e)})
-
-        except (KeyboardInterrupt, EOFError):
+        
+        except KeyboardInterrupt:
+            sys.stdout.write(f"Received SIGINT for process {process_id}\n")
+            sys.stdout.flush()
+            output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': "Execution interrupted"})
+        except EOFError:
             break
 
 
@@ -123,6 +135,13 @@ class DistributedMagics(Magics):
                     'namespace': {}
                 })
         return self.workers[n_processes]
+    
+    def _interrupt_workers(self, n_processes: int):
+        if n_processes not in self.workers:
+            print(f"Failed to interrupt distributed workers. No workers found for launch with {n_processes} processes.")
+            return
+        for worker_meta in self.workers[n_processes]:
+            os.kill(worker_meta['process'].pid, signal.SIGINT)
 
     @line_cell_magic
     @magic_arguments()
@@ -158,6 +177,9 @@ class DistributedMagics(Magics):
 
         # Send code to all worker processes
         for worker in workers:
+            # Clear output queue before starting
+            while not worker['output_queue'].empty():
+                worker['output_queue'].get()
             worker['input_queue'].put({'code': code, 'timeout': args.timeout})
 
         # Collect results and stream output
@@ -171,35 +193,50 @@ class DistributedMagics(Magics):
             timer = threading.Timer(args.timeout, timeout_event.set)
             timer.start()
 
-        while completed_count < n_processes and not timeout_event.is_set():
-            for i, worker in enumerate(workers):
-                if results[i] is not None:
-                    continue
-                try:
-                    output = worker['output_queue'].get(timeout=0.01)
+        try:
+            while completed_count < n_processes and not timeout_event.is_set():
+                for i, worker in enumerate(workers):
+                    if results[i] is not None:
+                        continue
+                    try:
+                        output = worker['output_queue'].get(timeout=0.01)
 
-                    if output['type'] == 'stdout':
-                        carriage_return = '\r'
-                        print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
-                    elif output['type'] == 'result':
-                        results[i] = output
-                        completed_count += 1
-                        if output['error']:
-                            errors.append(f"Process {output['process_id']}: {output['error']}")
-                        else:
-                            # Update local cache of namespace
-                            worker['namespace'].update(output['vars'])
+                        if output['type'] == 'stdout':
+                            carriage_return = '\r'
+                            print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
+                        elif output['type'] == 'result':
+                            results[i] = output
+                            completed_count += 1
+                            if output['error']:
+                                errors.append(f"Process {output['process_id']}: {output['error']}")
+                            else:
+                                # Update local cache of namespace
+                                worker['namespace'].update(output['vars'])
+                    except queue.Empty:
+                        continue
+        
+            if errors:
+                print(f"Execution completed with errors in {len(errors)} processes:")
+                for error in errors:
+                    print(f"  {error}")
+            else:
+                print(f"Successfully executed in all {n_processes} processes")
+
+        except KeyboardInterrupt:
+            print("\nExecution interrupted by user. Sending interrupt to workers...")
+            self._interrupt_workers(n_processes)
+            for i, worker in enumerate(workers):
+                try:
+                    while True:
+                        output = worker['output_queue'].get(timeout=2.0)
+                        if output['type'] == 'result' and output['error'] == 'Execution interrupted':
+                            break
                 except queue.Empty:
+                    print(f"Process {i} did not respond to interrupt after 2 seconds.")
                     continue
+                print(f"Process {i} interrupted successfully.")
         
         execution_time = time.time() - start_time
-        
-        if errors:
-            print(f"Execution completed with errors in {len(errors)} processes:")
-            for error in errors:
-                print(f"  {error}")
-        else:
-            print(f"Successfully executed in all {n_processes} processes")
             
         print(f"Execution time: {execution_time:.2f} seconds")
 
