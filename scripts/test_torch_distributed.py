@@ -20,8 +20,6 @@ tp_plan = {
     "model.layers.*.mlp.down_proj": "rowwise",
     "lm_head": "colwise_rep",
 }
-config = AutoConfig.from_pretrained(model_name, tp_plan=tp_plan)
-model = Qwen3ForCausalLM(config)
 model = AutoModelForCausalLM.from_pretrained(model_name, tp_plan=tp_plan)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 prompt = "Can I help"
