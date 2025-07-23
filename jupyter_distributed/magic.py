@@ -11,6 +11,7 @@ import time
 import multiprocess as mp
 import threading
 import queue
+import signal
 from typing import Dict, Any, List, Optional
 from IPython.core.magic import Magics, line_cell_magic, magics_class
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
@@ -22,6 +23,15 @@ def worker_process(input_queue, output_queue, process_id):
     A persistent worker process that maintains its own namespace and executes code.
     """
     namespace = {'__process_id__': process_id}
+
+    # Timeout handler
+    class TimeoutException(Exception):
+        pass
+
+    def timeout_handler(signum, frame):
+        raise TimeoutException()
+
+    signal.signal(signal.SIGALRM, timeout_handler)
     
     # Redirect stdout to a queue
     class QueueWriter:
@@ -45,10 +55,17 @@ def worker_process(input_queue, output_queue, process_id):
                 break
 
             code = task.get('code')
+            timeout = task.get('timeout')
 
             try:
+                if timeout:
+                    signal.alarm(timeout)
+                
                 exec(code, namespace)
                 sys.stdout.flush()
+                
+                if timeout:
+                    signal.alarm(0) # Cancel alarm
                 
                 # Filter out unpicklable objects from the namespace
                 result_vars = {}
@@ -63,6 +80,9 @@ def worker_process(input_queue, output_queue, process_id):
                 # For now do not return variables from distributed cells to non-distributed runtime
                 output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': None})
 
+            except TimeoutException:
+                sys.stdout.flush()
+                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': f"Execution timed out after {timeout} seconds"})
             except Exception as e:
                 sys.stdout.flush()
                 output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': str(e)})
@@ -138,19 +158,13 @@ class DistributedMagics(Magics):
 
         # Send code to all worker processes
         for worker in workers:
-            worker['input_queue'].put({'code': code})
+            worker['input_queue'].put({'code': code, 'timeout': args.timeout})
 
         # Collect results and stream output
         results = [None] * n_processes
         errors = []
         completed_count = 0
         
-        # Timeout handling
-        timeout_event = threading.Event()
-        if args.timeout:
-            timer = threading.Timer(args.timeout, timeout_event.set)
-            timer.start()
-
         # Use a single thread to process all output queues
         def process_output_queues(workers, results, errors, completed_count_ref):
             while completed_count_ref[0] < n_processes:
@@ -174,23 +188,15 @@ class DistributedMagics(Magics):
                                 worker['namespace'].update(output['vars'])
                     except queue.Empty:
                         continue
-                if timeout_event.is_set():
-                    break
         
         completed_count_ref = [0]
         output_thread = threading.Thread(target=process_output_queues, args=(workers, results, errors, completed_count_ref))
         output_thread.start()
         output_thread.join(timeout=args.timeout)
+
+        if not output_thread.is_alive():
+            pass
         
-        if args.timeout:
-            timer.cancel()
-
-        if timeout_event.is_set():
-            print(f"Execution timed out after {args.timeout} seconds.")
-            # Terminate and restart workers on timeout to clear state
-            self._cleanup_workers(n_processes)
-            return
-
         execution_time = time.time() - start_time
         
         if errors:
