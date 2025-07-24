@@ -7,7 +7,7 @@ versus definitions.
 """
 
 import ast
-from typing import List
+from typing import Set
 
 
 # Python built-ins that should be excluded from undefined variable detection
@@ -254,7 +254,7 @@ class VariableDefinitionCollector(ast.NodeVisitor):
         # For other types (Attribute, Subscript), we don't define new variables
 
 
-def find_undefined_variables(code: str) -> List[str]:
+def find_undefined_variables(code: str) -> Set[str]:
     """
     Find variables that are referenced but not defined in the given code.
     
@@ -286,4 +286,4 @@ def find_undefined_variables(code: str) -> List[str]:
     # Find undefined variables (referenced but not defined, excluding built-ins)
     undefined = ref_collector.referenced - def_collector.defined - PYTHON_BUILTINS
     
-    return list(undefined)
+    return undefined
