@@ -9,7 +9,6 @@ between cell executions.
 import sys
 import time
 import multiprocess as mp
-import threading
 import queue
 import signal
 from datetime import datetime
@@ -61,19 +60,20 @@ def worker_process(input_queue, output_queue, process_id):
         try:
             diag_start = datetime.now()
             log_diagnostic("Waiting for task from input queue")
-            task = input_queue.get()
-            debug = task.get('debug', False)
+            request = input_queue.get()
+            debug = request.get('debug', False)
 
-            if task is None:  # Shutdown signal
+            if request is None:  # Shutdown signal
                 log_diagnostic("Received shutdown signal")
                 break
 
-            request_type = task.get('task', 'execute')
-
             log_diagnostic("Received task, starting execution")
-            code = task.get('code')
-            vars_to_send = task.get('vars')
-            namespace_to_load = task.get('namespace', {})
+
+            request_type = request.get('task', 'execute')
+            task = request.get('task', 'execute')
+            code = request.get('code')
+            vars_to_send = request.get('vars')
+            namespace_to_load = request.get('namespace', {})
 
             try:
                 warnings = []
@@ -111,7 +111,7 @@ def worker_process(input_queue, output_queue, process_id):
                 log_diagnostic("Sending result to output queue")
                 output_queue.put({
                     'type': 'result',
-                    'task': task.get('task', 'execute'),
+                    'task': task,
                     'process_id': process_id,
                     'vars': result_vars,
                     'names': list(namespace.keys()),
@@ -142,6 +142,8 @@ class DistributedMagics(Magics):
     def __init__(self, shell=None):
         super().__init__(shell)
         self.workers = {}  # {n_processes: [worker_info]}
+        self.autoload = True
+        self.debug = False
         # Use 'spawn' start method for multiprocessing to avoid issues with
         # forked processes in interactive environments like Jupyter.
         try:
@@ -181,6 +183,8 @@ class DistributedMagics(Magics):
     @argument('n_processes', type=int, help='Number of processes to distribute across')
     @argument('--load_vars', nargs='+', type=str, default=[],
               help='List of variable names to load from the main namespace into each worker')
+    @argument('--no_autoload', action='store_false', dest='do_autoload', default=True,
+              help='Do not infer variables to be loaded from the main namespace into each worker')
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
     def distribute(self, line, cell=None):
         """
@@ -195,6 +199,7 @@ class DistributedMagics(Magics):
         """
         args = parse_argstring(self.distribute, line)
         n_processes = args.n_processes
+        debug = args.debug or self.debug
         
         if n_processes <= 0:
             print("Error: Number of processes must be positive")
@@ -212,7 +217,7 @@ class DistributedMagics(Magics):
 
         diag_start = datetime.now()
         def log_diagnostic(message):
-            if args.debug:
+            if debug:
                 elapsed_seconds = (datetime.now() - diag_start).total_seconds()
                 elapsed_minutes = elapsed_seconds // 60
                 elapsed_seconds %= 60
@@ -228,7 +233,7 @@ class DistributedMagics(Magics):
                 i: {var: self.shell.user_ns[var] for var in args.load_vars}
                 for i in range(n_processes)
             }
-        else:
+        elif args.do_autoload:
             var_list_by_proc = self.get_main_vars_to_distribute(
                 pool_id=n_processes,  # Use the smallest pool ID
                 process_ids=list(range(n_processes)),
@@ -238,6 +243,8 @@ class DistributedMagics(Magics):
                 proc_id: {var: self.shell.user_ns[var] for var in var_list}
                 for proc_id, var_list in var_list_by_proc.items()
             }
+        else:
+            send_namespace_by_proc = {i: {} for i in range(n_processes)}
 
         # Send code to all worker processes
         log_diagnostic(f"Starting to send tasks to {n_processes} workers")
@@ -245,7 +252,7 @@ class DistributedMagics(Magics):
             # Clear output queue before starting
             while not worker['output_queue'].empty():
                 worker['output_queue'].get()
-            worker['input_queue'].put({'type': 'execute', 'code': code, 'debug': args.debug, 'namespace': send_namespace_by_proc[i], 'task': 'execute'})
+            worker['input_queue'].put({'type': 'execute', 'code': code, 'debug': debug, 'namespace': send_namespace_by_proc[i], 'task': 'execute'})
             log_diagnostic(f"Task sent to worker {i}")
 
         # Collect results and stream output
@@ -318,6 +325,23 @@ class DistributedMagics(Magics):
 
     @line_cell_magic
     @magic_arguments()
+    @argument('--autoload', type=str, choices=['on', 'off'], default='on',
+              help='Set whether to automatically load variables across main/distributed namespaces')
+    @argument('--debug', type=str, choices=['on', 'off'], default='off',
+              help='Enable or disable diagnostic logging in worker processes')
+    def configure_distribute(self, line: str):
+        """
+        Toggle automatic loading of variables across main and distributed namespaces.
+
+        Usage:
+            %configure_distribute [--autoload on|off] [--debug on|off]
+        """
+        args = parse_argstring(self.configure_distribute, line)
+        self.autoload = (args.autoload == 'enable')
+        self.debug = (args.debug == 'on')
+
+    @line_cell_magic
+    @magic_arguments()
     @argument('vars', nargs='*', type=str, help='List of variable names to save')
     @argument('--from', type=int, default=0, dest='process_id', help='Process ID to load variables from')
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
@@ -338,7 +362,7 @@ class DistributedMagics(Magics):
         """
         diag_start = datetime.now()
         def log_diagnostic(message):
-            if args.debug:
+            if debug:
                 elapsed_seconds = (datetime.now() - diag_start).total_seconds()
                 elapsed_minutes = elapsed_seconds // 60
                 elapsed_seconds %= 60
@@ -346,10 +370,11 @@ class DistributedMagics(Magics):
                 print(f"[MAIN] at {relative_timestamp}: {message}\n")
         
         args = parse_argstring(self.load_vars, line)
+        debug = args.debug or self.debug
         self.run_load_vars(
             var_list=args.vars,
             process_id=args.process_id,
-            debug=args.debug,
+            debug=debug,
             cell=cell,
         )
 
@@ -382,7 +407,7 @@ class DistributedMagics(Magics):
             pass
         elif cell is None:
             raise ValueError("no variables specified to load. Use `%load_vars <name1> <name2> ...` to specify variable names "
-                             "or run with `%%load_vars` so the current cell's code is available to infer variables.")
+                             "or run with `%%load_vars` to infer variables from the current cell's code.")
         else:
             undef_vars = find_undefined_variables(cell)
             var_list = (undef_vars - set(self.shell.user_ns.keys())).intersection(worker['namespace'])
@@ -510,14 +535,16 @@ class DistributedMagics(Magics):
 
     def pre_cell_hook(self, info):
         """A hook that runs before each cell is executed."""
+        # skip for distributed calls, or if autoload is disabled
         code = info.raw_cell
         if (code.startswith("%%distribute") or
-            code.startswith("%%load_vars")):  # skip for distributed calls
+            code.startswith("%%load_vars") or
+            not self.autoload):
             return
         self.run_load_vars(
             var_list=[],      # infer variables to load from cell content
             process_id=0,
-            debug=True,
+            debug=False,
             cell=code,
         )
 
