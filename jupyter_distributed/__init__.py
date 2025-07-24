@@ -11,8 +11,8 @@ except ImportError:
 
 from .magic import DistributedMagics
 
-# Global instance to hold the magic object
 _magic_instance = None
+
 
 def load_ipython_extension(ipython):
     """Load the extension in IPython."""
@@ -20,6 +20,7 @@ def load_ipython_extension(ipython):
     if _magic_instance is None:
         _magic_instance = DistributedMagics(ipython)
         ipython.register_magics(_magic_instance)
+        ipython.events.register('pre_run_cell', _magic_instance.pre_cell_hook)
         print("Jupyter Distributed extension with persistent processes loaded.")
     else:
         print("Jupyter Distributed extension already loaded.")
@@ -30,6 +31,7 @@ def unload_ipython_extension(ipython):
     if _magic_instance:
         # Clean up worker processes
         _magic_instance._cleanup_workers()
+        ipython.events.unregister('pre_run_cell', _magic_instance.pre_cell_hook)
         _magic_instance = None
         print("Jupyter Distributed extension unloaded and processes cleaned up.")
 

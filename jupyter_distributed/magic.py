@@ -291,7 +291,7 @@ class DistributedMagics(Magics):
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
     @argument('--noexec', action='store_false', dest='exec_code', default=True,
               help='Do not execute the cell code, only load variables')
-    def load_vars(self, line, cell=None):
+    def load_vars(self, line: str, cell: Optional[str] = None):
         """
         Load variables from a specific worker process and update the current
         namespace with their values.
@@ -304,29 +304,6 @@ class DistributedMagics(Magics):
             %%load_vars [VAR1 VAR2 ...] [--from PROCESS_ID] [--debug]
             <cell content>
         """
-        args = parse_argstring(self.load_vars, line)
-        
-        # Find the process pool with the smallest number of distributed processes
-        if not self.workers:
-            raise RuntimeError("No distributed workers available. Run %%distribute first to create worker processes.")
-        
-        worker_n_procs = min(self.workers.keys())
-        
-        # Validate process_id exists in the selected pool
-        if args.process_id >= len(self.workers[worker_n_procs]):
-            raise ValueError(f"Process ID {args.process_id} does not exist in the worker pool with {worker_n_procs} processes. "
-                           f"Available process IDs: 0-{len(self.workers[worker_n_procs])-1}")
-        
-        worker = self.workers[worker_n_procs][args.process_id]
-
-        if args.vars:
-            var_list = args.vars
-        elif cell is None:
-            raise ValueError("no variables specified to load. Use --vars to specify variable names or run with "
-                             "`%%%%load_vars` so the current cell's code is available to extract variables.")
-        else:
-            var_list = find_undefined_variables(cell)
-
         diag_start = datetime.now()
         def log_diagnostic(message):
             if args.debug:
@@ -335,9 +312,59 @@ class DistributedMagics(Magics):
                 elapsed_seconds %= 60
                 relative_timestamp = f"{elapsed_minutes:.0f}:{elapsed_seconds:.5f}"
                 print(f"[MAIN] at {relative_timestamp}: {message}\n")
+        
+        args = parse_argstring(self.load_vars, line)
+        self.run_load_vars(
+            var_list=args.vars,
+            process_id=args.process_id,
+            debug=args.debug,
+            cell=cell,
+        )
+
+        # if we've loaded variables successfully execute the cell code with the modified scope
+        if args.exec_code and cell is not None:
+            log_diagnostic("Executing cell code with loaded variables")
+            self.shell.run_cell(cell, store_history=False, silent=False, shell_futures=True)
+
+    def run_load_vars(
+        self,
+        var_list: List[str],
+        process_id: int,
+        debug: bool = False,
+        cell: Optional[str] = None,
+    ):      
+        # Find the process pool with the smallest number of distributed processes
+        if not self.workers:
+            raise RuntimeError("No distributed workers available. Run %%distribute first to create worker processes.")
+        
+        worker_n_procs = min(self.workers.keys())
+        
+        # Validate process_id exists in the selected pool
+        if process_id >= len(self.workers[worker_n_procs]):
+            raise ValueError(f"Process ID {process_id} does not exist in the worker pool with {worker_n_procs} processes. "
+                           f"Available process IDs: 0-{len(self.workers[worker_n_procs])-1}")
+        
+        worker = self.workers[worker_n_procs][process_id]
+
+        if var_list:
+            pass
+        elif cell is None:
+            raise ValueError("no variables specified to load. Use --vars to specify variable names or run with "
+                             "`%%load_vars` so the current cell's code is available to extract variables.")
+        else:
+            var_list = find_undefined_variables(cell)
+
+        diag_start = datetime.now()
+        def log_diagnostic(message):
+            if debug:
+                elapsed_seconds = (datetime.now() - diag_start).total_seconds()
+                elapsed_minutes = elapsed_seconds // 60
+                elapsed_seconds %= 60
+                relative_timestamp = f"{elapsed_minutes:.0f}:{elapsed_seconds:.5f}"
+                print(f"[MAIN] at {relative_timestamp}: {message}\n")
 
         # query distributed process for variables
-        worker['input_queue'].put({'type': 'load_vars', 'task': 'load_vars', 'vars': var_list, 'debug': args.debug})
+        worker['input_queue'].put({'type': 'load_vars', 'task': 'load_vars', 'vars': var_list, 'debug': debug})
 
         try:
             while True:
@@ -348,7 +375,7 @@ class DistributedMagics(Magics):
                         carriage_return = '\r'
                         print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
                     elif output['type'] == 'result':
-                        log_diagnostic(f"Received result from worker {args.process_id} with process ID {output['process_id']}")
+                        log_diagnostic(f"Received result from worker {process_id} with process ID {output['process_id']}")
                         if output['error']:
                             print(f"Execution error in process {output['process_id']}: {output['error']}", flush=True)
                         if output.get('warnings'):
@@ -363,21 +390,16 @@ class DistributedMagics(Magics):
 
         except KeyboardInterrupt:
             print("\nExecution interrupted by user. Sending interrupt to workers...")
-            self._interrupt_workers(worker_n_procs, process_id=args.process_id)
+            self._interrupt_workers(worker_n_procs, process_id=process_id)
             try:
                 while True:
                     output = worker['output_queue'].get(timeout=1.0)
                     if output['type'] == 'result' and output['error'] == 'Execution interrupted':
                         break
             except queue.Empty:
-                print(f"Process {args.process_id} did not respond to interrupt after 2 seconds.")
+                print(f"Process {process_id} did not respond to interrupt after 2 seconds.")
                 return
-            print(f"Process {args.process_id} interrupted successfully.")
-
-        # if we've loaded variables successfully execute the cell code with the modified scope
-        if args.exec_code and cell is not None:
-            log_diagnostic("Executing cell code with loaded variables")
-            self.shell.run_cell(cell, store_history=False, silent=False, shell_futures=True)
+            print(f"Process {process_id} interrupted successfully.")
 
     def _cleanup_workers(self, n_processes: Optional[int] = None):
         """Terminate and clean up worker processes."""
@@ -401,6 +423,18 @@ class DistributedMagics(Magics):
     def __del__(self):
         """Clean up all worker processes when the magic object is destroyed."""
         self._cleanup_workers()
+
+    def pre_cell_hook(self, info):
+        """A hook that runs before each cell is executed."""
+        code = info.raw_cell
+        if not code.startswith("%%distribute"):  # skip for distributed calls
+            self.run_load_vars(
+                var_list=[],      # infer variables to load from cell content
+                process_id=0,
+                debug=False,
+                cell=code,
+            )
+
 
 # Standalone function for direct registration
 def distribute_magic(line, cell=None):
