@@ -72,7 +72,8 @@ def worker_process(input_queue, output_queue, process_id):
 
             log_diagnostic("Received task, starting execution")
             code = task.get('code')
-            vars_to_load = task.get('vars')
+            vars_to_send = task.get('vars')
+            namespace_to_load = task.get('namespace', {})
 
             try:
                 warnings = []
@@ -81,6 +82,7 @@ def worker_process(input_queue, output_queue, process_id):
                 if request_type == 'execute':
                     if code is None:
                         raise ValueError("no code provided for execution")
+                    namespace.update(namespace_to_load)
                     log_diagnostic("About to execute code")
                     exec_start = time.time()
                     exec(code, namespace)
@@ -93,9 +95,9 @@ def worker_process(input_queue, output_queue, process_id):
                         warnings.append("stdout/stderr have been modified by the executed code, which may lead to unexpected behavior.")
                 elif request_type == 'load_vars':
                     log_diagnostic("Loading variables from namespace")
-                    if vars_to_load is None:
+                    if vars_to_send is None:
                         raise ValueError("no variables specified to load")
-                    for var in vars_to_load:
+                    for var in vars_to_send:
                         if var not in namespace:
                             raise NameError(f"name '{var}' is not defined")
                         log_diagnostic(f"Attempting to pickle variable '{var}'. Pickling large variables may cause OOM.")
@@ -104,10 +106,17 @@ def worker_process(input_queue, output_queue, process_id):
                             dill.dumps(value)
                             result_vars[var] = value
                         except (TypeError, AttributeError, dill.PicklingError):
-                            raise TypeError(f"variable '{var}' failed to pickle and cannot be loaded across processes")\
+                            raise TypeError(f"variable '{var}' failed to pickle and cannot be loaded across processes")
                 
                 log_diagnostic("Sending result to output queue")
-                output_queue.put({'type': 'result', 'task': task, 'process_id': process_id, 'vars': result_vars, 'error': None, 'warnings': warnings})
+                output_queue.put({
+                    'type': 'result',
+                    'task': task.get('task', 'execute'),
+                    'process_id': process_id,
+                    'vars': result_vars,
+                    'names': list(namespace.keys()),
+                    'error': None,
+                    'warnings': warnings})
                 log_diagnostic("Result sent successfully")
 
             except KeyboardInterrupt:
@@ -208,13 +217,24 @@ class DistributedMagics(Magics):
                 relative_timestamp = f"{elapsed_minutes:.0f}:{elapsed_seconds:.5f}"
                 print(f"[MAIN] at {relative_timestamp}: {message}\n")
 
+        # Get variables to load from the main namespace
+        var_list_by_proc = self.get_main_vars_to_distribute(
+            pool_id=n_processes,  # Use the smallest pool ID
+            process_ids=list(range(n_processes)),
+            cell=cell,
+        )
+        send_namespace_by_proc = {
+            proc_id: {var: self.shell.user_ns[var] for var in var_list}
+            for proc_id, var_list in var_list_by_proc.items()
+        }
+
         # Send code to all worker processes
         log_diagnostic(f"Starting to send tasks to {n_processes} workers")
         for i, worker in enumerate(workers):
             # Clear output queue before starting
             while not worker['output_queue'].empty():
                 worker['output_queue'].get()
-            worker['input_queue'].put({'type': 'execute', 'code': code, 'debug': args.debug})
+            worker['input_queue'].put({'type': 'execute', 'code': code, 'debug': args.debug, 'namespace': send_namespace_by_proc[i], 'task': 'execute'})
             log_diagnostic(f"Task sent to worker {i}")
 
         # Collect results and stream output
@@ -239,7 +259,7 @@ class DistributedMagics(Magics):
                         if output['type'] == 'stdout':
                             carriage_return = '\r'
                             print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
-                        elif output['type'] == 'result':
+                        elif output['type'] == 'result' and output['task'] == 'execute':
                             log_diagnostic(f"Received result from worker {i} with process ID {output['process_id']}")
                             results[i] = output
                             completed_count += 1
@@ -247,7 +267,8 @@ class DistributedMagics(Magics):
                                 errors.append(f"Process {output['process_id']}: {output['error']}")
                             else:
                                 # Update local cache of namespace
-                                worker['namespace'].update(output['vars'])
+                                if output.get('names') is not None:
+                                    worker['namespace'] = output['names']
                         if output.get('warnings'):
                             for warning in output['warnings']:
                                 print(f"[Process {output['process_id']}] Warning: {warning}", flush=True)
@@ -276,7 +297,7 @@ class DistributedMagics(Magics):
                         if output['type'] == 'result' and output['error'] == 'Execution interrupted':
                             break
                 except queue.Empty:
-                    print(f"Process {i} did not respond to interrupt after 2 seconds.")
+                    print(f"Process {i} did not respond to interrupt after 1 seconds.")
                     continue
                 print(f"Process {i} interrupted successfully.")
         
@@ -337,14 +358,14 @@ class DistributedMagics(Magics):
         if not self.workers:
             raise RuntimeError("No distributed workers available. Run %%distribute first to create worker processes.")
         
-        worker_n_procs = min(self.workers.keys())
+        pool_id = min(self.workers.keys())
         
         # Validate process_id exists in the selected pool
-        if process_id >= len(self.workers[worker_n_procs]):
-            raise ValueError(f"Process ID {process_id} does not exist in the worker pool with {worker_n_procs} processes. "
-                           f"Available process IDs: 0-{len(self.workers[worker_n_procs])-1}")
+        if process_id >= len(self.workers[pool_id]):
+            raise ValueError(f"Process ID {process_id} does not exist in worker pool '{pool_id}'. "
+                             f"Available process IDs: 0-{len(self.workers[pool_id])-1}")
         
-        worker = self.workers[worker_n_procs][process_id]
+        worker = self.workers[pool_id][process_id]
 
         if var_list:
             pass
@@ -352,22 +373,14 @@ class DistributedMagics(Magics):
             raise ValueError("no variables specified to load. Use `%load_vars <name1> <name2> ...` to specify variable names "
                              "or run with `%%load_vars` so the current cell's code is available to infer variables.")
         else:
-            var_list = find_undefined_variables(cell)
-            if mutually_defined := var_list.intersection(self.shell.user_ns.keys()):
+            undef_vars = find_undefined_variables(cell)
+            var_list = (undef_vars - set(self.shell.user_ns.keys())).intersection(worker['namespace'])
+            if mutually_defined := undef_vars.intersection(self.shell.user_ns.keys()).intersection(worker['namespace']):
                 mutual_string = ", ".join(list(map(lambda x: f"'{x}'", mutually_defined))[:2])
                 mutual_string += f", +{len(mutually_defined) - 2} more" if len(mutually_defined) > 2 else ""
-                abridged_var_list = ", ".join(list(mutually_defined)[:2])
-                abridged_var_list += ", ..." if len(var_list) > 2 else ""
-                name_names = "names" if len(mutually_defined) > 1 else "name"
-                is_are = "are" if len(mutually_defined) > 1 else "is"
-                it_them = "it" if len(mutually_defined) == 1 else "them"
-                its_their_value_values = "its value" if len(mutually_defined) == 1 else "their values"
-                print(f"Warning: {name_names} {mutual_string} {is_are} mutually defined in main namespace and distributed namespaces. "
-                      f"To load {it_them} from a distributed namespace use `%%load_vars {abridged_var_list}`, otherwise "
-                      f"{its_their_value_values} from the main namespace will be used.")
-                var_list = list(var_list - set(mutually_defined))
-            else:
-                var_list = list(var_list)
+                print(f"Warning: the following names are mutually defined in main namespace and distributed namespaces: "
+                      f"{mutual_string}. To load from a distributed namespace use `%%load_vars <name1> <name2> ...`, "
+                      "otherwise values from the main namespace will be used.")
         
         if not var_list:
             return
@@ -384,7 +397,7 @@ class DistributedMagics(Magics):
         log_diagnostic(f"Loading variables to main namespace from process {process_id}: {var_list}")
 
         # query distributed process for variables
-        worker['input_queue'].put({'type': 'load_vars', 'task': 'load_vars', 'vars': var_list, 'debug': debug})
+        worker['input_queue'].put({'type': 'request', 'task': 'load_vars', 'vars': var_list, 'debug': debug})
 
         try:
             while True:
@@ -394,7 +407,7 @@ class DistributedMagics(Magics):
                     if output['type'] == 'stdout':
                         carriage_return = '\r'
                         print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
-                    elif output['type'] == 'result':
+                    elif output['type'] == 'result' and output['task'] == 'load_vars':
                         log_diagnostic(f"Received result from worker {process_id} with process ID {output['process_id']}")
                         if output['error']:
                             print(f"Execution error in process {output['process_id']}: {output['error']}", flush=True)
@@ -404,99 +417,62 @@ class DistributedMagics(Magics):
                         if output['vars']:
                             # Update local cache of namespace
                             self.shell.user_ns.update(output['vars'])
-                            break
+                            return
                 except queue.Empty:
                     continue
 
         except KeyboardInterrupt:
             print("\nExecution interrupted by user. Sending interrupt to workers...")
-            self._interrupt_workers(worker_n_procs, process_id=process_id)
+            self._interrupt_workers(pool_id, process_id=process_id)
             try:
                 while True:
                     output = worker['output_queue'].get(timeout=1.0)
                     if output['type'] == 'result' and output['error'] == 'Execution interrupted':
                         break
             except queue.Empty:
-                print(f"Process {process_id} did not respond to interrupt after 2 seconds.")
+                print(f"Process {process_id} did not respond to interrupt after 1 seconds.")
                 return
             print(f"Process {process_id} interrupted successfully.")
 
-    # def run_load_vars_distribute(
-    #     self,
-    #     var_list: List[str],
-    #     process_id: int,
-    #     debug: bool = False,
-    #     cell: Optional[str] = None,
-    #     to_pool_id: Optional[str] = None,
-    #     to_process
-    # ):      
-    #     # Find the process pool with the smallest number of distributed processes
-    #     if not self.workers:
-    #         raise RuntimeError("No distributed workers available. Run %%distribute first to create worker processes.")
+    def get_main_vars_to_distribute(
+        self,
+        pool_id: str = "default",
+        process_ids: List[int] = [],
+        cell: Optional[str] = None,
+    ) -> Dict[int, str]:
+        # Find the process pool with the smallest number of distributed processes
+        if not self.workers:
+            raise RuntimeError("No distributed workers available. Run %%distribute first to create worker processes.")
         
-    #     worker_n_procs = min(self.workers.keys())
+        if not process_ids:
+            process_ids = list(range(len(self.workers[pool_id])))
+
+        pool_id = min(self.workers.keys())
         
-    #     # Validate process_id exists in the selected pool
-    #     if process_id >= len(self.workers[worker_n_procs]):
-    #         raise ValueError(f"Process ID {process_id} does not exist in the worker pool with {worker_n_procs} processes. "
-    #                        f"Available process IDs: 0-{len(self.workers[worker_n_procs])-1}")
+        # Validate process_id exists in the selected pool
+        for process_id in process_ids:
+            if process_id >= len(self.workers[pool_id]):
+                raise ValueError(f"Process ID {process_id} does not exist in worker pool '{pool_id}'. "
+                                 f"Available process IDs: 0-{len(self.workers[pool_id])-1}")
+
+        var_list_by_process = {}
+        if cell is None:
+            raise ValueError("no variables specified to load. Use `%load_vars <name1> <name2> ...` to specify variable names "
+                             "or run with `%%load_vars` so the current cell's code is available to infer variables.")
+        else:
+            undef_vars = find_undefined_variables(cell)
+            for process_id in process_ids:
+                worker = self.workers[pool_id][process_id]
+                var_list = (undef_vars - set(worker['namespace'])).intersection(self.shell.user_ns.keys())
+                if mutually_defined := undef_vars.intersection(set(worker['namespace'])).intersection(self.shell.user_ns.keys()):
+                    mutual_string = ", ".join(list(map(lambda x: f"'{x}'", mutually_defined))[:2])
+                    mutual_string += f", +{len(mutually_defined) - 2} more" if len(mutually_defined) > 2 else ""
+                    print(f"Warning: the following names are mutually defined in main namespace and process {process_id}: "
+                          f"{mutual_string}. To load from the main namespace use `%%load_vars <name1> <name2> ...`, "
+                          f"otherwise values from the namespace of process {process_id} will be used.")
+                var_list_by_process[process_id] = var_list
         
-    #     worker = self.workers[worker_n_procs][process_id]
-
-    #     if var_list:
-    #         pass
-    #     elif cell is None:
-    #         raise ValueError("no variables specified to load. Use --vars to specify variable names or run with "
-    #                          "`%%load_vars` so the current cell's code is available to extract variables.")
-    #     else:
-    #         var_list = find_undefined_variables(cell)
-
-    #     diag_start = datetime.now()
-    #     def log_diagnostic(message):
-    #         if debug:
-    #             elapsed_seconds = (datetime.now() - diag_start).total_seconds()
-    #             elapsed_minutes = elapsed_seconds // 60
-    #             elapsed_seconds %= 60
-    #             relative_timestamp = f"{elapsed_minutes:.0f}:{elapsed_seconds:.5f}"
-    #             print(f"[MAIN] at {relative_timestamp}: {message}\n")
-
-    #     # query distributed process for variables
-    #     worker['input_queue'].put({'type': 'load_vars', 'task': 'load_vars', 'vars': var_list, 'debug': debug})
-
-    #     try:
-    #         while True:
-    #             try:
-    #                 output = worker['output_queue'].get(timeout=0.01)
-
-    #                 if output['type'] == 'stdout':
-    #                     carriage_return = '\r'
-    #                     print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
-    #                 elif output['type'] == 'result':
-    #                     log_diagnostic(f"Received result from worker {process_id} with process ID {output['process_id']}")
-    #                     if output['error']:
-    #                         print(f"Execution error in process {output['process_id']}: {output['error']}", flush=True)
-    #                     if output.get('warnings'):
-    #                         for warning in output['warnings']:
-    #                             print(f"[Process {output['process_id']}] Warning: {warning}", flush=True)
-    #                     if output['vars']:
-    #                         # Update local cache of namespace
-    #                         self.shell.user_ns.update(output['vars'])
-    #                         break
-    #             except queue.Empty:
-    #                 continue
-
-    #     except KeyboardInterrupt:
-    #         print("\nExecution interrupted by user. Sending interrupt to workers...")
-    #         self._interrupt_workers(worker_n_procs, process_id=process_id)
-    #         try:
-    #             while True:
-    #                 output = worker['output_queue'].get(timeout=1.0)
-    #                 if output['type'] == 'result' and output['error'] == 'Execution interrupted':
-    #                     break
-    #         except queue.Empty:
-    #             print(f"Process {process_id} did not respond to interrupt after 2 seconds.")
-    #             return
-    #         print(f"Process {process_id} interrupted successfully.")
+        return var_list_by_process
 
     def _cleanup_workers(self, n_processes: Optional[int] = None):
         """Terminate and clean up worker processes."""
@@ -524,13 +500,15 @@ class DistributedMagics(Magics):
     def pre_cell_hook(self, info):
         """A hook that runs before each cell is executed."""
         code = info.raw_cell
-        if not code.startswith("%%distribute"):  # skip for distributed calls
-            self.run_load_vars(
-                var_list=[],      # infer variables to load from cell content
-                process_id=0,
-                debug=False,
-                cell=code,
-            )
+        if (code.startswith("%%distribute") or
+            code.startswith("%%load_vars")):  # skip for distributed calls
+            return
+        self.run_load_vars(
+            var_list=[],      # infer variables to load from cell content
+            process_id=0,
+            debug=True,
+            cell=code,
+        )
 
 
 # Standalone function for direct registration
