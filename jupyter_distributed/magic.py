@@ -179,6 +179,8 @@ class DistributedMagics(Magics):
     @line_cell_magic
     @magic_arguments()
     @argument('n_processes', type=int, help='Number of processes to distribute across')
+    @argument('--load_vars', nargs='+', type=str, default=[],
+              help='List of variable names to load from the main namespace into each worker')
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
     def distribute(self, line, cell=None):
         """
@@ -218,15 +220,24 @@ class DistributedMagics(Magics):
                 print(f"[MAIN] at {relative_timestamp}: {message}\n")
 
         # Get variables to load from the main namespace
-        var_list_by_proc = self.get_main_vars_to_distribute(
-            pool_id=n_processes,  # Use the smallest pool ID
-            process_ids=list(range(n_processes)),
-            cell=cell,
-        )
-        send_namespace_by_proc = {
-            proc_id: {var: self.shell.user_ns[var] for var in var_list}
-            for proc_id, var_list in var_list_by_proc.items()
-        }
+        if args.load_vars:
+            for var in args.load_vars:
+                if var not in self.shell.user_ns:
+                    raise NameError(f"name '{var}' is not defined in the main namespace")
+            send_namespace_by_proc = {
+                i: {var: self.shell.user_ns[var] for var in args.load_vars}
+                for i in range(n_processes)
+            }
+        else:
+            var_list_by_proc = self.get_main_vars_to_distribute(
+                pool_id=n_processes,  # Use the smallest pool ID
+                process_ids=list(range(n_processes)),
+                cell=cell,
+            )
+            send_namespace_by_proc = {
+                proc_id: {var: self.shell.user_ns[var] for var in var_list}
+                for proc_id, var_list in var_list_by_proc.items()
+            }
 
         # Send code to all worker processes
         log_diagnostic(f"Starting to send tasks to {n_processes} workers")
