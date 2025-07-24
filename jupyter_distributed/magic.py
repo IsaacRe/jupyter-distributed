@@ -25,15 +25,6 @@ def worker_process(input_queue, output_queue, process_id):
     A persistent worker process that maintains its own namespace and executes code.
     """
     namespace = {'__process_id__': process_id}
-
-    # Timeout handler
-    class TimeoutException(Exception):
-        pass
-
-    def timeout_handler(signum, frame):
-        raise TimeoutException()
-
-    signal.signal(signal.SIGALRM, timeout_handler)
     
     # Redirect stdout to a queue
     class QueueWriter:
@@ -77,13 +68,9 @@ def worker_process(input_queue, output_queue, process_id):
 
             log_diagnostic("Received task, starting execution")
             code = task.get('code')
-            timeout = task.get('timeout')
 
             try:
                 warnings = []
-
-                if timeout:
-                    signal.alarm(timeout)
                 
                 log_diagnostic("About to execute code")
                 exec_start = time.time()
@@ -91,9 +78,6 @@ def worker_process(input_queue, output_queue, process_id):
                 exec_end = time.time()
                 log_diagnostic(f"Code execution completed in {exec_end - exec_start:.3f} seconds")
                 sys.stdout.flush()
-                
-                if timeout:
-                    signal.alarm(0) # Cancel alarm
 
                 # Alert if stdout/stderr has been tampered with by the executed code
                 if not (isinstance(sys.stdout, QueueWriter) and isinstance(sys.stderr, QueueWriter)):
@@ -113,9 +97,6 @@ def worker_process(input_queue, output_queue, process_id):
                 output_queue.put({'type': 'result', 'process_id': process_id, 'vars': result_vars, 'error': None, 'warnings': warnings})
                 log_diagnostic("Result sent successfully")
 
-            except TimeoutException:
-                sys.stdout.flush()
-                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': f"Execution timed out after {timeout} seconds"})
             except KeyboardInterrupt:
                 sys.stdout.write(f"Received SIGINT for process {process_id}\n")
                 sys.stdout.flush()
@@ -176,14 +157,13 @@ class DistributedMagics(Magics):
     @magic_arguments()
     @argument('n_processes', type=int, help='Number of processes to distribute across')
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
-    @argument('--timeout', type=int, default=None, help='Timeout in seconds for execution')
     def distribute(self, line, cell=None):
         """
         Distribute cell execution across n persistent processes.
         
         Usage:
-            %distribute n [--timeout SECONDS]
-            %%distribute n [--timeout SECONDS]
+            %distribute n [--debug]
+            %%distribute n [--debug]
             <cell content>
         
         Variables persist in each process across multiple calls.
@@ -220,25 +200,19 @@ class DistributedMagics(Magics):
             # Clear output queue before starting
             while not worker['output_queue'].empty():
                 worker['output_queue'].get()
-            worker['input_queue'].put({'code': code, 'timeout': args.timeout, 'debug': args.debug})
+            worker['input_queue'].put({'code': code, 'debug': args.debug})
             log_diagnostic(f"Task sent to worker {i}")
 
         # Collect results and stream output
         results = [None] * n_processes
         errors = []
         completed_count = 0
-        
-        # Timeout handling
-        timeout_event = threading.Event()
-        if args.timeout:
-            timer = threading.Timer(args.timeout, timeout_event.set)
-            timer.start()
 
         log_diagnostic(f"Starting result collection")
         last_activity = time.time()
         
         try:
-            while completed_count < n_processes and not timeout_event.is_set():
+            while completed_count < n_processes:
                 activity_this_cycle = False
                 for i, worker in enumerate(workers):
                     if results[i] is not None:
@@ -284,7 +258,7 @@ class DistributedMagics(Magics):
             for i, worker in enumerate(workers):
                 try:
                     while True:
-                        output = worker['output_queue'].get(timeout=2.0)
+                        output = worker['output_queue'].get(timeout=1.0)
                         if output['type'] == 'result' and output['error'] == 'Execution interrupted':
                             break
                 except queue.Empty:

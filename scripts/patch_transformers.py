@@ -7,8 +7,6 @@ the specified code blocks in modeling_utils.py and tensor_parallel.py.
 
 import os
 import sys
-import re
-import importlib.util
 
 
 def find_transformers_location():
