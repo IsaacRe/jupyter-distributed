@@ -66,49 +66,60 @@ def worker_process(input_queue, output_queue, process_id):
                 log_diagnostic("Received shutdown signal")
                 break
 
+            request_type = task.get('task', 'execute')
+
             log_diagnostic("Received task, starting execution")
             code = task.get('code')
+            vars_to_load = task.get('vars')
 
             try:
                 warnings = []
+                result_vars = {}
                 
-                log_diagnostic("About to execute code")
-                exec_start = time.time()
-                exec(code, namespace)
-                exec_end = time.time()
-                log_diagnostic(f"Code execution completed in {exec_end - exec_start:.3f} seconds")
-                sys.stdout.flush()
+                if request_type == 'execute':
+                    if code is None:
+                        raise ValueError("no code provided for execution")
+                    log_diagnostic("About to execute code")
+                    exec_start = time.time()
+                    exec(code, namespace)
+                    exec_end = time.time()
+                    log_diagnostic(f"Code execution completed in {exec_end - exec_start:.3f} seconds")
+                    sys.stdout.flush()
 
-                # Alert if stdout/stderr has been tampered with by the executed code
-                if not (isinstance(sys.stdout, QueueWriter) and isinstance(sys.stderr, QueueWriter)):
-                    warnings.append("stdout/stderr have been modified by the executed code, which may lead to unexpected behavior.")
+                    # Alert if stdout/stderr has been tampered with by the executed code
+                    if not (isinstance(sys.stdout, QueueWriter) and isinstance(sys.stderr, QueueWriter)):
+                        warnings.append("stdout/stderr have been modified by the executed code, which may lead to unexpected behavior.")
+                elif request_type == 'load_vars':
+                    log_diagnostic("Loading variables from namespace")
+                    if vars_to_load is None:
+                        raise ValueError("no variables specified to load")
+                    for var in vars_to_load:
+                        if var not in namespace:
+                            raise NameError(f"name '{var}' is not defined")
+                        log_diagnostic(f"Attempting to pickle variable '{var}'. Pickling large variables may cause OOM.")
+                        value = namespace[var]
+                        try:
+                            dill.dumps(value)
+                            result_vars[var] = value
+                        except (TypeError, AttributeError, dill.PicklingError):
+                            raise TypeError(f"variable '{var}' failed to pickle and cannot be loaded across processes")\
                 
                 log_diagnostic("Sending result to output queue")
-                # For now do not return variables from distributed cells to non-distributed runtime
-                # Filter out unpicklable objects from the namespace
-                result_vars = {}
-                # for key, value in namespace.items():
-                #     if not key.startswith('__'):
-                #         try:
-                #             dill.dumps(value)
-                #             result_vars[key] = value
-                #         except (TypeError, AttributeError, dill.PicklingError):
-                #             pass # Skip unpicklable
-                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': result_vars, 'error': None, 'warnings': warnings})
+                output_queue.put({'type': 'result', 'task': task, 'process_id': process_id, 'vars': result_vars, 'error': None, 'warnings': warnings})
                 log_diagnostic("Result sent successfully")
 
             except KeyboardInterrupt:
                 sys.stdout.write(f"Received SIGINT for process {process_id}\n")
                 sys.stdout.flush()
-                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': "Execution interrupted"})
+                output_queue.put({'type': 'result', 'task': task, 'process_id': process_id, 'vars': {}, 'error': "Execution interrupted"})
             except Exception as e:
                 sys.stdout.flush()
-                output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': str(e)})
+                output_queue.put({'type': 'result', 'task': task, 'process_id': process_id, 'vars': {}, 'error': str(e)})
         
         except KeyboardInterrupt:
             sys.stdout.write(f"Received SIGINT for process {process_id}\n")
             sys.stdout.flush()
-            output_queue.put({'type': 'result', 'process_id': process_id, 'vars': {}, 'error': "Execution interrupted"})
+            output_queue.put({'type': 'result', 'task': task, 'process_id': process_id, 'vars': {}, 'error': "Execution interrupted"})
         except EOFError:
             break
 
@@ -129,6 +140,10 @@ class DistributedMagics(Magics):
             # We'll proceed, but the user might see warnings.
             pass
 
+    def _get_undefined_variables(self, code: str) -> List[str]:
+        """Find variables in the code that are not defined in the current namespace."""
+        raise NotImplementedError
+
     def _get_or_create_workers(self, n_processes: int) -> List[Dict[str, Any]]:
         """Get or create a set of persistent worker processes."""
         if n_processes not in self.workers:
@@ -146,12 +161,13 @@ class DistributedMagics(Magics):
                 })
         return self.workers[n_processes]
     
-    def _interrupt_workers(self, n_processes: int):
+    def _interrupt_workers(self, n_processes: int, process_id: Optional[int] = None):
         if n_processes not in self.workers:
             print(f"Failed to interrupt distributed workers. No workers found for launch with {n_processes} processes.")
             return
-        for worker_meta in self.workers[n_processes]:
-            os.kill(worker_meta['process'].pid, signal.SIGINT)
+        for proc_id, worker_meta in enumerate(self.workers[n_processes]):
+            if process_id is None or proc_id == process_id:
+                os.kill(worker_meta['process'].pid, signal.SIGINT)
 
     @line_cell_magic
     @magic_arguments()
@@ -160,13 +176,13 @@ class DistributedMagics(Magics):
     def distribute(self, line, cell=None):
         """
         Distribute cell execution across n persistent processes.
-        
+
+        Variables persist in each process across multiple calls.
+
         Usage:
             %distribute n [--debug]
             %%distribute n [--debug]
             <cell content>
-        
-        Variables persist in each process across multiple calls.
         """
         args = parse_argstring(self.distribute, line)
         n_processes = args.n_processes
@@ -200,7 +216,7 @@ class DistributedMagics(Magics):
             # Clear output queue before starting
             while not worker['output_queue'].empty():
                 worker['output_queue'].get()
-            worker['input_queue'].put({'code': code, 'debug': args.debug})
+            worker['input_queue'].put({'type': 'execute', 'code': code, 'debug': args.debug})
             log_diagnostic(f"Task sent to worker {i}")
 
         # Collect results and stream output
@@ -269,6 +285,83 @@ class DistributedMagics(Magics):
         execution_time = time.time() - start_time
             
         print(f"Execution time: {execution_time:.2f} seconds")
+
+    @line_cell_magic
+    @magic_arguments()
+    @argument('vars', nargs='*', type=str, help='List of variable names to save')
+    @argument('--from', type=int, default=0, dest='process_id', help='Process ID to load variables from')
+    @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
+    def load_vars(self, line, cell=None):
+        """
+        Load variables from a specific worker process and update the current
+        namespace with their values.
+
+        If no variables are explicitly specified, it will attempt to extract
+        undefined variables from the current cell's code.
+        
+        Usage:
+            %load_vars VAR1 VAR2 ... [--from PROCESS_ID] [--debug]
+            %%load_vars [VAR1 VAR2 ...] [--from PROCESS_ID] [--debug]
+            <cell content>
+        """
+        args = parse_argstring(self.load_vars, line)
+        worker_n_procs = next(iter(self.workers.keys()))
+        worker = self.workers[worker_n_procs][args.process_id]
+
+        if args.vars:
+            var_list = args.vars
+        elif cell is None:
+            raise ValueError("no variables specified to load. Use --vars to specify variable names or run with "
+                             "`%%%%load_vars` so the current cell's code is available to extract variables.")
+        else:
+            var_list = self._get_undefined_variables(cell)
+
+        diag_start = datetime.now()
+        def log_diagnostic(message):
+            if args.debug:
+                elapsed_seconds = (datetime.now() - diag_start).total_seconds()
+                elapsed_minutes = elapsed_seconds // 60
+                elapsed_seconds %= 60
+                relative_timestamp = f"{elapsed_minutes:.0f}:{elapsed_seconds:.5f}"
+                print(f"[MAIN] at {relative_timestamp}: {message}\n")
+
+        # query distributed process for variables
+        worker['input_queue'].put({'type': 'load_vars', 'task': 'load_vars', 'vars': var_list, 'debug': args.debug})
+
+        try:
+            while True:
+                try:
+                    output = worker['output_queue'].get(timeout=0.01)
+
+                    if output['type'] == 'stdout':
+                        carriage_return = '\r'
+                        print(f"[Process {output['process_id']}] {output['data'].strip(carriage_return)}", flush=True)
+                    elif output['type'] == 'result':
+                        log_diagnostic(f"Received result from worker {args.process_id} with process ID {output['process_id']}")
+                        if output['error']:
+                            print(f"Execution error in process {output['process_id']}: {output['error']}", flush=True)
+                        if output.get('warnings'):
+                            for warning in output['warnings']:
+                                print(f"[Process {output['process_id']}] Warning: {warning}", flush=True)
+                        if output['vars']:
+                            # Update local cache of namespace
+                            self.shell.user_ns.update(output['vars'])
+                            return
+                except queue.Empty:
+                    continue
+
+        except KeyboardInterrupt:
+            print("\nExecution interrupted by user. Sending interrupt to workers...")
+            self._interrupt_workers(worker_n_procs, process_id=args.process_id)
+            try:
+                while True:
+                    output = worker['output_queue'].get(timeout=1.0)
+                    if output['type'] == 'result' and output['error'] == 'Execution interrupted':
+                        break
+            except queue.Empty:
+                print(f"Process {args.process_id} did not respond to interrupt after 2 seconds.")
+                return
+            print(f"Process {args.process_id} interrupted successfully.")
 
     def _cleanup_workers(self, n_processes: Optional[int] = None):
         """Terminate and clean up worker processes."""
