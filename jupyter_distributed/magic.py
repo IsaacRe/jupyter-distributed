@@ -19,6 +19,8 @@ from IPython.core.magic import Magics, line_cell_magic, magics_class
 from IPython.core.magic_arguments import (argument, magic_arguments, parse_argstring)
 import dill
 
+from .utils.ast import find_undefined_variables
+
 # Worker process function
 def worker_process(input_queue, output_queue, process_id):
     """
@@ -139,10 +141,6 @@ class DistributedMagics(Magics):
             # This can happen if the context is already set and we can't force it.
             # We'll proceed, but the user might see warnings.
             pass
-
-    def _get_undefined_variables(self, code: str) -> List[str]:
-        """Find variables in the code that are not defined in the current namespace."""
-        raise NotImplementedError
 
     def _get_or_create_workers(self, n_processes: int) -> List[Dict[str, Any]]:
         """Get or create a set of persistent worker processes."""
@@ -291,6 +289,8 @@ class DistributedMagics(Magics):
     @argument('vars', nargs='*', type=str, help='List of variable names to save')
     @argument('--from', type=int, default=0, dest='process_id', help='Process ID to load variables from')
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
+    @argument('--noexec', action='store_false', dest='exec_code', default=True,
+              help='Do not execute the cell code, only load variables')
     def load_vars(self, line, cell=None):
         """
         Load variables from a specific worker process and update the current
@@ -305,7 +305,18 @@ class DistributedMagics(Magics):
             <cell content>
         """
         args = parse_argstring(self.load_vars, line)
-        worker_n_procs = next(iter(self.workers.keys()))
+        
+        # Find the process pool with the smallest number of distributed processes
+        if not self.workers:
+            raise RuntimeError("No distributed workers available. Run %%distribute first to create worker processes.")
+        
+        worker_n_procs = min(self.workers.keys())
+        
+        # Validate process_id exists in the selected pool
+        if args.process_id >= len(self.workers[worker_n_procs]):
+            raise ValueError(f"Process ID {args.process_id} does not exist in the worker pool with {worker_n_procs} processes. "
+                           f"Available process IDs: 0-{len(self.workers[worker_n_procs])-1}")
+        
         worker = self.workers[worker_n_procs][args.process_id]
 
         if args.vars:
@@ -314,7 +325,7 @@ class DistributedMagics(Magics):
             raise ValueError("no variables specified to load. Use --vars to specify variable names or run with "
                              "`%%%%load_vars` so the current cell's code is available to extract variables.")
         else:
-            var_list = self._get_undefined_variables(cell)
+            var_list = find_undefined_variables(cell)
 
         diag_start = datetime.now()
         def log_diagnostic(message):
@@ -346,7 +357,7 @@ class DistributedMagics(Magics):
                         if output['vars']:
                             # Update local cache of namespace
                             self.shell.user_ns.update(output['vars'])
-                            return
+                            break
                 except queue.Empty:
                     continue
 
@@ -362,6 +373,11 @@ class DistributedMagics(Magics):
                 print(f"Process {args.process_id} did not respond to interrupt after 2 seconds.")
                 return
             print(f"Process {args.process_id} interrupted successfully.")
+
+        # if we've loaded variables successfully execute the cell code with the modified scope
+        if args.exec_code and cell is not None:
+            log_diagnostic("Executing cell code with loaded variables")
+            self.shell.run_cell(cell, store_history=False, silent=False, shell_futures=True)
 
     def _cleanup_workers(self, n_processes: Optional[int] = None):
         """Terminate and clean up worker processes."""
