@@ -397,7 +397,11 @@ class DistributedMagics(Magics):
         # if we've loaded variables successfully execute the cell code with the modified scope
         if args.exec_code and cell is not None:
             log_diagnostic("Executing cell code with loaded variables")
+            # Disable autoload
+            previous_autoload = self.autoload
+            self.autoload = False
             self.shell.run_cell(cell, store_history=False, silent=False, shell_futures=True)
+            self.autoload = previous_autoload
 
     def run_load_vars(
         self,
@@ -551,9 +555,9 @@ class DistributedMagics(Magics):
     def pre_cell_hook(self, info):
         """A hook that runs before each cell is executed."""
         # skip for distributed calls, or if autoload is disabled
-        code = info.raw_cell
-        if (code.startswith("%%distribute") or
-            code.startswith("%%load_vars") or
+        raw_cell = info.raw_cell
+        if (raw_cell.startswith("%%distribute") or
+            raw_cell.startswith("%%load_vars") or
             not self.autoload):
             return
         print("Running pre-cell hook to load variables from distributed processes...")
@@ -562,7 +566,7 @@ class DistributedMagics(Magics):
             pool_id='default',
             process_id=0,
             debug=False,
-            cell=code,
+            cell=raw_cell,
         )
 
 

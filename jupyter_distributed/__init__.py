@@ -25,6 +25,7 @@ def load_ipython_extension(ipython):
     else:
         print("Jupyter Distributed extension already loaded.")
 
+
 def unload_ipython_extension(ipython):
     """Unload the extension from IPython and clean up resources."""
     global _magic_instance
@@ -35,5 +36,5 @@ def unload_ipython_extension(ipython):
         _magic_instance = None
         print("Jupyter Distributed extension unloaded and processes cleaned up.")
 
-# Make the magic available for direct import
+
 __all__ = ['DistributedMagics', 'load_ipython_extension', 'unload_ipython_extension']
