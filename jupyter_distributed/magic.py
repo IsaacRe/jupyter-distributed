@@ -141,7 +141,7 @@ class DistributedMagics(Magics):
     
     def __init__(self, shell=None):
         super().__init__(shell)
-        self.workers = {}  # {n_processes: [worker_info]}
+        self.workers = {}  # {pool_id: [worker_info]}
         self.autoload = True
         self.debug = False
         # Use 'spawn' start method for multiprocessing to avoid issues with
@@ -153,28 +153,40 @@ class DistributedMagics(Magics):
             # We'll proceed, but the user might see warnings.
             pass
 
-    def _get_or_create_workers(self, n_processes: int) -> List[Dict[str, Any]]:
+    def _get_or_create_workers(self, n_processes: int, pool_id: str) -> List[Dict[str, Any]]:
         """Get or create a set of persistent worker processes."""
-        if n_processes not in self.workers:
-            self.workers[n_processes] = []
+        if pool_id not in self.workers:
+            self.workers[pool_id] = []
             for i in range(n_processes):
                 input_queue = mp.Queue()
                 output_queue = mp.Queue()
                 process = mp.Process(target=worker_process, args=(input_queue, output_queue, i), daemon=True)
                 process.start()
-                self.workers[n_processes].append({
+                self.workers[pool_id].append({
                     'process': process,
                     'input_queue': input_queue,
                     'output_queue': output_queue,
                     'namespace': {}
                 })
-        return self.workers[n_processes]
+        elif len(self.workers[pool_id]) < n_processes:
+            for i in range(len(self.workers[pool_id]), n_processes):
+                input_queue = mp.Queue()
+                output_queue = mp.Queue()
+                process = mp.Process(target=worker_process, args=(input_queue, output_queue, i), daemon=True)
+                process.start()
+                self.workers[pool_id].append({
+                    'process': process,
+                    'input_queue': input_queue,
+                    'output_queue': output_queue,
+                    'namespace': {}
+                })
+        return self.workers[pool_id][:n_processes]
     
-    def _interrupt_workers(self, n_processes: int, process_id: Optional[int] = None):
-        if n_processes not in self.workers:
-            print(f"Failed to interrupt distributed workers. No workers found for launch with {n_processes} processes.")
+    def _interrupt_workers(self, pool_id: str, process_id: Optional[int] = None):
+        if pool_id not in self.workers:
+            print(f"Failed to interrupt distributed workers. Process pool '{pool_id}' not found.")
             return
-        for proc_id, worker_meta in enumerate(self.workers[n_processes]):
+        for proc_id, worker_meta in enumerate(self.workers[pool_id]):
             if process_id is None or proc_id == process_id:
                 os.kill(worker_meta['process'].pid, signal.SIGINT)
 
@@ -186,6 +198,8 @@ class DistributedMagics(Magics):
     @argument('--no_autoload', action='store_false', dest='do_autoload', default=True,
               help='Do not infer variables to be loaded from the main namespace into each worker')
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
+    @argument('--pool_id', type=str, default='default',
+              help="Identifier for the worker process pool. If not specified, 'default' is used")
     def distribute(self, line, cell=None):
         """
         Distribute cell execution across n persistent processes.
@@ -210,7 +224,7 @@ class DistributedMagics(Magics):
             print("Error: No code to execute")
             return
             
-        workers = self._get_or_create_workers(n_processes)
+        workers = self._get_or_create_workers(n_processes, args.pool_id)
         
         print(f"Distributing execution across {n_processes} persistent processes...")
         start_time = time.time()
@@ -343,7 +357,8 @@ class DistributedMagics(Magics):
     @line_cell_magic
     @magic_arguments()
     @argument('vars', nargs='*', type=str, help='List of variable names to save')
-    @argument('--from', type=int, default=0, dest='process_id', help='Process ID to load variables from')
+    @argument('--pool_id', type=str, default='default', help='Process pool to load variables from')
+    @argument('--process_id', type=int, default=0, help='Process ID to load variables from')
     @argument('--debug', action='store_true', help='Enable diagnostic logging in worker processes')
     @argument('--noexec', action='store_false', dest='exec_code', default=True,
               help='Do not execute the cell code, only load variables')
@@ -373,6 +388,7 @@ class DistributedMagics(Magics):
         debug = args.debug or self.debug
         self.run_load_vars(
             var_list=args.vars,
+            pool_id=args.pool_id,
             process_id=args.process_id,
             debug=debug,
             cell=cell,
@@ -386,6 +402,7 @@ class DistributedMagics(Magics):
     def run_load_vars(
         self,
         var_list: List[str],
+        pool_id: str,
         process_id: int,
         debug: bool = False,
         cell: Optional[str] = None,
@@ -393,9 +410,7 @@ class DistributedMagics(Magics):
         # Find the process pool with the smallest number of distributed processes
         if not self.workers:
             raise RuntimeError("No distributed workers available. Run %%distribute first to create worker processes.")
-        
-        pool_id = min(self.workers.keys())
-        
+                
         # Validate process_id exists in the selected pool
         if process_id >= len(self.workers[pool_id]):
             raise ValueError(f"Process ID {process_id} does not exist in worker pool '{pool_id}'. "
@@ -541,8 +556,10 @@ class DistributedMagics(Magics):
             code.startswith("%%load_vars") or
             not self.autoload):
             return
+        print("Running pre-cell hook to load variables from distributed processes...")
         self.run_load_vars(
             var_list=[],      # infer variables to load from cell content
+            pool_id='default',
             process_id=0,
             debug=False,
             cell=code,
